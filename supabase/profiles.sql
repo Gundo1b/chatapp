@@ -58,13 +58,9 @@ for select
 to anon, authenticated
 using (true);
 
-drop policy if exists "Public can update profiles" on public.profiles;
-create policy "Public can update profiles"
-on public.profiles
-for update
-to anon, authenticated
-using (true)
-with check (true);
+
+
+
 
 -- Storage bucket for profile photos
 insert into storage.buckets (id, name, public)
@@ -84,37 +80,3 @@ on storage.objects
 for select
 to anon, authenticated
 using (bucket_id = 'profile-pictures');
-
--- Friend requests
-create table if not exists public.friend_requests (
-  id uuid primary key default gen_random_uuid(),
-  sender_name text not null references public.profiles(name) on delete cascade,
-  receiver_name text not null references public.profiles(name) on delete cascade,
-  status text not null default 'pending' check (status in ('pending', 'accepted', 'rejected')),
-  created_at timestamptz not null default now(),
-  unique (sender_name, receiver_name)
-);
-
-alter table public.friend_requests enable row level security;
-
-drop policy if exists "Public can insert friend requests" on public.friend_requests;
-create policy "Public can insert friend requests"
-on public.friend_requests
-for insert
-to anon, authenticated
-with check (true);
-
-drop policy if exists "Public can read friend requests" on public.friend_requests;
-create policy "Public can read friend requests"
-on public.friend_requests
-for select
-to anon, authenticated
-using (true);
-
-drop policy if exists "Public can update friend requests" on public.friend_requests;
-create policy "Public can update friend requests"
-on public.friend_requests
-for update
-to anon, authenticated
-using (true)
-with check (true);
