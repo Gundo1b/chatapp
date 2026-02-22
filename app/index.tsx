@@ -1,11 +1,13 @@
-import { useState } from 'react'
-import { Alert, Image, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
+import { useEffect, useState } from 'react'
+import { ActivityIndicator, Alert, Image, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
 import { LinearGradient } from 'expo-linear-gradient'
 import * as ImagePicker from 'expo-image-picker'
 import { useRouter } from 'expo-router'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 import { supabase } from '../src/lib/supabaseClient'
 
-type Step = 1 | 2 | 3 | 4
+type Step = 1 | 2 | 3 | 4 | 5
+type NameStatus = boolean | null
 
 export default function Index() {
   const router = useRouter()
@@ -14,7 +16,73 @@ export default function Index() {
   const [gender, setGender] = useState('')
   const [age, setAge] = useState('')
   const [photos, setPhotos] = useState<(string | null)[]>([null, null, null])
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
   const [saving, setSaving] = useState(false)
+  const [checkingSession, setCheckingSession] = useState(true)
+  const [checkingName, setCheckingName] = useState(false)
+  const [isNameAvailable, setIsNameAvailable] = useState<NameStatus>(null)
+  const [nameCheckError, setNameCheckError] = useState('')
+
+  useEffect(() => {
+    const bootstrapSession = async () => {
+      const storedProfile = await AsyncStorage.getItem('registered_profile')
+      if (storedProfile) {
+        try {
+          const parsed = JSON.parse(storedProfile) as { name?: string; gender?: string; age?: number }
+          router.replace({
+            pathname: '/dashboard',
+            params: {
+              name: parsed.name || 'User',
+              gender: parsed.gender || '-',
+              age: String(parsed.age ?? '-'),
+            },
+          })
+          return
+        } catch {
+          await AsyncStorage.removeItem('registered_profile')
+        }
+      }
+      setCheckingSession(false)
+    }
+
+    void bootstrapSession()
+  }, [router])
+
+  useEffect(() => {
+    if (checkingSession) return
+    const trimmedName = name.trim()
+
+    if (!trimmedName) {
+      setCheckingName(false)
+      setIsNameAvailable(null)
+      setNameCheckError('')
+      return
+    }
+
+    const timeoutId = setTimeout(async () => {
+      setCheckingName(true)
+      setNameCheckError('')
+
+      const { data: existingProfile, error } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('name', trimmedName)
+        .maybeSingle()
+
+      if (error) {
+        setIsNameAvailable(null)
+        setNameCheckError('Could not verify name right now.')
+        setCheckingName(false)
+        return
+      }
+
+      setIsNameAvailable(!existingProfile)
+      setCheckingName(false)
+    }, 450)
+
+    return () => clearTimeout(timeoutId)
+  }, [name, checkingSession])
 
   const pickPhoto = async (slot: number) => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
@@ -39,6 +107,11 @@ export default function Index() {
 
   const onContinueFromName = () => {
     if (!name.trim()) return
+    if (checkingName) return
+    if (isNameAvailable !== true) {
+      Alert.alert('Name unavailable', 'Please choose a different name.')
+      return
+    }
     setStep(2)
   }
 
@@ -56,28 +129,83 @@ export default function Index() {
     setStep(4)
   }
 
-  const onSaveAndGoDashboard = async () => {
+  const onContinueFromPhotos = () => {
     const picked = photos.filter((photo): photo is string => Boolean(photo))
     if (picked.length < 3) {
       Alert.alert('Missing photos', 'Please add 3 photos before continuing.')
       return
     }
+    setStep(5)
+  }
+
+  const onSaveAndGoDashboard = async () => {
+    const trimmedName = name.trim()
+    const picked = photos.filter((photo): photo is string => Boolean(photo))
+    const trimmedPassword = password.trim()
+
+    if (picked.length < 3) {
+      Alert.alert('Missing photos', 'Please add 3 photos before continuing.')
+      return
+    }
+
+    if (trimmedPassword.length < 8) {
+      Alert.alert('Weak password', 'Password must be at least 8 characters.')
+      return
+    }
+
+    if (trimmedPassword !== confirmPassword.trim()) {
+      Alert.alert('Password mismatch', 'Password and confirm password must match.')
+      return
+    }
 
     setSaving(true)
+
+    const { data: existingProfile, error: lookupError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('name', trimmedName)
+      .maybeSingle()
+
+    if (lookupError) {
+      setSaving(false)
+      Alert.alert('Database error', lookupError.message)
+      return
+    }
+
+    if (existingProfile) {
+      setSaving(false)
+      Alert.alert('Name unavailable', 'That name already exists. Please choose another one.')
+      return
+    }
+
     const profile = {
-      name: name.trim(),
+      name: trimmedName,
       gender,
       age: Number(age),
       pictures: picked,
+      password_hash: trimmedPassword,
     }
 
     const { error } = await supabase.from('profiles').insert(profile)
     setSaving(false)
 
     if (error) {
+      if (error.code === '23505') {
+        Alert.alert('Name unavailable', 'That name already exists. Please choose another one.')
+        return
+      }
       Alert.alert('Database error', error.message)
       return
     }
+
+    await AsyncStorage.setItem(
+      'registered_profile',
+      JSON.stringify({
+        name: profile.name,
+        gender: profile.gender,
+        age: profile.age,
+      }),
+    )
 
     router.replace({
       pathname: '/dashboard',
@@ -87,9 +215,20 @@ export default function Index() {
 
   const completedPhotos = photos.filter(Boolean).length
 
+  if (checkingSession) {
+    return (
+      <View style={styles.container}>
+        <View style={styles.card}>
+          <ActivityIndicator size="large" color="#FF5864" />
+        </View>
+      </View>
+    )
+  }
+
   return (
     <View style={styles.container}>
       <View style={styles.card}>
+        <Image source={require('../assets/images/logo.png')} style={styles.logo} resizeMode="contain" />
         {step === 1 ? (
           <>
             <Text style={styles.title}>What is your name?</Text>
@@ -101,7 +240,19 @@ export default function Index() {
               placeholderTextColor="#6B7280"
               style={styles.input}
             />
-            <Pressable onPress={onContinueFromName} disabled={!name.trim()} style={!name.trim() ? styles.disabled : undefined}>
+            {nameCheckError ? <Text style={styles.nameStatusError}>{nameCheckError}</Text> : null}
+            {!nameCheckError && checkingName ? <Text style={styles.nameStatusNeutral}>Checking name...</Text> : null}
+            {!nameCheckError && !checkingName && name.trim() && isNameAvailable === true ? (
+              <Text style={styles.nameStatusAvailable}>Name is available</Text>
+            ) : null}
+            {!nameCheckError && !checkingName && name.trim() && isNameAvailable === false ? (
+              <Text style={styles.nameStatusError}>That name already exists</Text>
+            ) : null}
+            <Pressable
+              onPress={onContinueFromName}
+              disabled={!name.trim() || checkingName || isNameAvailable !== true}
+              style={!name.trim() || checkingName || isNameAvailable !== true ? styles.disabled : undefined}
+            >
               <LinearGradient colors={['#FD297B', '#FF655B']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.primaryButton}>
                 <Text style={styles.primaryButtonText}>Continue</Text>
               </LinearGradient>
@@ -183,12 +334,47 @@ export default function Index() {
                 </Pressable>
               ))}
             </View>
-            <Pressable onPress={onSaveAndGoDashboard} disabled={saving || completedPhotos < 3} style={saving || completedPhotos < 3 ? styles.disabled : undefined}>
+            <Pressable onPress={onContinueFromPhotos} disabled={completedPhotos < 3} style={completedPhotos < 3 ? styles.disabled : undefined}>
               <LinearGradient colors={['#FD297B', '#FF655B']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.primaryButton}>
-                <Text style={styles.primaryButtonText}>{saving ? 'Saving...' : 'Go to dashboard'}</Text>
+                <Text style={styles.primaryButtonText}>Continue</Text>
               </LinearGradient>
             </Pressable>
             <Pressable onPress={() => setStep(3)} style={styles.secondaryButton}>
+              <Text style={styles.secondaryButtonText}>Back</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {step === 5 ? (
+          <>
+            <Text style={styles.title}>Create a password</Text>
+            <Text style={styles.subtitle}>Use at least 8 characters.</Text>
+            <TextInput
+              value={password}
+              onChangeText={setPassword}
+              placeholder="Enter password"
+              placeholderTextColor="#6B7280"
+              secureTextEntry
+              style={styles.input}
+            />
+            <TextInput
+              value={confirmPassword}
+              onChangeText={setConfirmPassword}
+              placeholder="Confirm password"
+              placeholderTextColor="#6B7280"
+              secureTextEntry
+              style={styles.input}
+            />
+            <Pressable
+              onPress={onSaveAndGoDashboard}
+              disabled={saving || password.trim().length < 8 || confirmPassword.trim().length < 8}
+              style={saving || password.trim().length < 8 || confirmPassword.trim().length < 8 ? styles.disabled : undefined}
+            >
+              <LinearGradient colors={['#FD297B', '#FF655B']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.primaryButton}>
+                <Text style={styles.primaryButtonText}>{saving ? 'Saving...' : 'Finish registration'}</Text>
+              </LinearGradient>
+            </Pressable>
+            <Pressable onPress={() => setStep(4)} style={styles.secondaryButton}>
               <Text style={styles.secondaryButtonText}>Back</Text>
             </Pressable>
           </>
@@ -214,6 +400,11 @@ const styles = StyleSheet.create({
     padding: 20,
     gap: 10,
   },
+  logo: {
+    width: 150,
+    height: 72,
+    alignSelf: 'center',
+  },
   title: {
     fontSize: 26,
     fontWeight: '700',
@@ -233,6 +424,18 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     color: '#1E1E1E',
     fontSize: 16,
+  },
+  nameStatusNeutral: {
+    fontSize: 13,
+    color: '#6B7280',
+  },
+  nameStatusAvailable: {
+    fontSize: 13,
+    color: '#15803D',
+  },
+  nameStatusError: {
+    fontSize: 13,
+    color: '#B91C1C',
   },
   primaryButton: {
     borderRadius: 12,
