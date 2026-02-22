@@ -9,6 +9,66 @@ import { supabase } from '../src/lib/supabaseClient'
 type Step = 1 | 2 | 3 | 4 | 5
 type NameStatus = boolean | null
 
+const PHOTO_BUCKET = 'profile-pictures'
+
+const guessImageExtension = (uri: string) => {
+  const match = uri.match(/\.([a-zA-Z0-9]+)(?:\?|$)/)
+  const ext = match?.[1]?.toLowerCase()
+  if (!ext) return 'jpg'
+  if (ext === 'jpeg' || ext === 'jpg' || ext === 'png' || ext === 'webp' || ext === 'heic') return ext
+  return 'jpg'
+}
+
+const contentTypeForExtension = (ext: string) => {
+  switch (ext) {
+    case 'png':
+      return 'image/png'
+    case 'webp':
+      return 'image/webp'
+    case 'heic':
+      return 'image/heic'
+    default:
+      return 'image/jpeg'
+  }
+}
+
+const sanitizePathSegment = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || 'user'
+
+const uploadProfilePictures = async (profileName: string, pictureUris: string[]) => {
+  const safeName = sanitizePathSegment(profileName)
+  const uploadedUrls: string[] = []
+
+  for (let i = 0; i < pictureUris.length; i += 1) {
+    const uri = pictureUris[i]
+    const ext = guessImageExtension(uri)
+    const contentType = contentTypeForExtension(ext)
+    const objectPath = `${safeName}/${Date.now()}-${i}.${ext}`
+
+    const response = await fetch(uri)
+    const blob = await response.blob()
+
+    const { error: uploadError } = await supabase.storage.from(PHOTO_BUCKET).upload(objectPath, blob, {
+      contentType,
+      upsert: false,
+    })
+
+    if (uploadError) {
+      throw new Error(uploadError.message)
+    }
+
+    const { data } = supabase.storage.from(PHOTO_BUCKET).getPublicUrl(objectPath)
+    uploadedUrls.push(data.publicUrl)
+  }
+
+  return uploadedUrls
+}
+
 export default function Index() {
   const router = useRouter()
   const [step, setStep] = useState<Step>(1)
@@ -29,13 +89,20 @@ export default function Index() {
       const storedProfile = await AsyncStorage.getItem('registered_profile')
       if (storedProfile) {
         try {
-          const parsed = JSON.parse(storedProfile) as { name?: string; gender?: string; age?: number }
+          const parsed = JSON.parse(storedProfile) as {
+            name?: string
+            gender?: string
+            age?: number
+            avatar?: string
+            pictures?: string[]
+          }
           router.replace({
             pathname: '/dashboard',
             params: {
               name: parsed.name || 'User',
               gender: parsed.gender || '-',
               age: String(parsed.age ?? '-'),
+              avatar: parsed.avatar || '',
             },
           })
           return
@@ -178,11 +245,21 @@ export default function Index() {
       return
     }
 
+    let uploadedPictures: string[] = []
+    try {
+      uploadedPictures = await uploadProfilePictures(trimmedName, picked)
+    } catch (uploadError) {
+      setSaving(false)
+      const message = uploadError instanceof Error ? uploadError.message : 'Could not upload photos.'
+      Alert.alert('Upload error', message)
+      return
+    }
+
     const profile = {
       name: trimmedName,
       gender,
       age: Number(age),
-      pictures: picked,
+      pictures: uploadedPictures,
       password_hash: trimmedPassword,
     }
 
@@ -204,12 +281,19 @@ export default function Index() {
         name: profile.name,
         gender: profile.gender,
         age: profile.age,
+        avatar: uploadedPictures[0] || '',
+        pictures: uploadedPictures,
       }),
     )
 
     router.replace({
       pathname: '/dashboard',
-      params: { name: profile.name, gender: profile.gender, age: String(profile.age) },
+      params: {
+        name: profile.name,
+        gender: profile.gender,
+        age: String(profile.age),
+        avatar: uploadedPictures[0] || '',
+      },
     })
   }
 
