@@ -36,6 +36,14 @@ type ChatMessage = {
   sender_name: string
   created_at: string
 }
+type ChatMessageRow = {
+  id: string
+  sender_name: string
+  receiver_name: string
+  message_text: string
+  created_at: string
+  read_at?: string | null
+}
 const PHOTO_BUCKET = 'profile-pictures'
 const ACCOUNT_PICTURE_SLOTS = 3
 
@@ -100,6 +108,10 @@ export default function Dashboard() {
   const [activeChatFriend, setActiveChatFriend] = useState<SearchProfile | null>(null)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatDraft, setChatDraft] = useState('')
+  const [loadingChatMessages, setLoadingChatMessages] = useState(false)
+  const [sendingChatMessage, setSendingChatMessage] = useState(false)
+  const [unreadChatCount, setUnreadChatCount] = useState(0)
+  const [unreadByFriend, setUnreadByFriend] = useState<Record<string, number>>({})
   const [friendSearchQuery, setFriendSearchQuery] = useState('')
   const routeName = typeof params.name === 'string' ? params.name.trim() : ''
   const currentProfileName = (storedProfile.name || routeName).trim()
@@ -610,6 +622,36 @@ export default function Dashboard() {
     await loadIncomingInvites()
   }
 
+  const openFriendChat = (friend: SearchProfile) => {
+    const friendKey = friend.name.trim().toLowerCase()
+    const unreadForFriend = unreadByFriend[friendKey] || 0
+
+    if (unreadForFriend > 0) {
+      setUnreadByFriend((current) => {
+        const next = { ...current }
+        delete next[friendKey]
+        return next
+      })
+      setUnreadChatCount((current) => Math.max(0, current - unreadForFriend))
+    }
+
+    setShowInvitesPanel(false)
+    setSelectedSearchProfile(null)
+    setActiveTab('chat')
+    setActiveChatFriend(friend)
+    void supabase
+      .from('chat_messages')
+      .update({ read_at: new Date().toISOString() })
+      .ilike('receiver_name', currentProfileName.trim())
+      .ilike('sender_name', friend.name.trim())
+      .is('read_at', null)
+  }
+
+  const activeFriendUnreadCount = activeChatFriend
+    ? unreadByFriend[activeChatFriend.name.trim().toLowerCase()] || 0
+    : 0
+  const visibleUnreadChatCount = Math.max(0, unreadChatCount - activeFriendUnreadCount)
+
   const onRespondToInvite = async (inviteId: string, nextStatus: 'accepted' | 'rejected') => {
     setProcessingInviteId(inviteId)
     try {
@@ -632,11 +674,12 @@ export default function Dashboard() {
           const friendKey = matchedInvite.sender_name.trim().toLowerCase()
           setFriendProfileNames((current) => (current.includes(friendKey) ? current : [...current, friendKey]))
         }
-        setShowInvitesPanel(false)
-        setActiveTab('chat')
-        setSelectedSearchProfile(null)
         if (matchedInvite?.sender_profile) {
-          setActiveChatFriend(matchedInvite.sender_profile)
+          openFriendChat(matchedInvite.sender_profile)
+        } else {
+          setShowInvitesPanel(false)
+          setActiveTab('chat')
+          setSelectedSearchProfile(null)
         }
       }
     } catch {
@@ -651,65 +694,164 @@ export default function Dashboard() {
     setZoomImageUri(uri)
   }
 
-  const getChatStorageKey = useCallback(
-    (friendName: string) => {
-      const current = currentProfileName.trim().toLowerCase()
-      const friend = friendName.trim().toLowerCase()
-      if (!current || !friend) return ''
-      const sorted = [current, friend].sort()
-      return `chat_thread_${sorted[0]}_${sorted[1]}`
-    },
-    [currentProfileName],
-  )
+  const activeChatIsFriend = activeChatFriend
+    ? friendProfileNames.includes(activeChatFriend.name.trim().toLowerCase())
+    : false
+
+  const refreshUnreadCounts = useCallback(async () => {
+    if (!currentProfileName) {
+      setUnreadChatCount(0)
+      setUnreadByFriend({})
+      return
+    }
+
+    const { data, error } = await supabase
+      .from('chat_messages')
+      .select('sender_name')
+      .ilike('receiver_name', currentProfileName)
+      .is('read_at', null)
+
+    if (error) return
+
+    const rows = data || []
+    const nextByFriend: Record<string, number> = {}
+    rows.forEach((row) => {
+      const key = row.sender_name?.trim().toLowerCase()
+      if (!key) return
+      nextByFriend[key] = (nextByFriend[key] || 0) + 1
+    })
+
+    setUnreadByFriend(nextByFriend)
+    setUnreadChatCount(rows.length)
+  }, [currentProfileName])
 
   useEffect(() => {
-    const loadConversation = async () => {
+    const loadConversation = async (showLoader: boolean) => {
       if (!activeChatFriend?.name) {
         setChatMessages([])
         return
       }
 
-      const storageKey = getChatStorageKey(activeChatFriend.name)
-      if (!storageKey) {
+      const currentName = currentProfileName.trim()
+      const friendName = activeChatFriend.name.trim()
+      if (!currentName || !friendName) {
         setChatMessages([])
         return
       }
 
-      const stored = await AsyncStorage.getItem(storageKey)
-      if (!stored) {
-        setChatMessages([])
+      if (showLoader) setLoadingChatMessages(true)
+      const { data, error } = await supabase
+        .from('chat_messages')
+        .select('id, sender_name, receiver_name, message_text, created_at')
+        .or(
+          `and(sender_name.ilike.${currentName},receiver_name.ilike.${friendName}),and(sender_name.ilike.${friendName},receiver_name.ilike.${currentName})`,
+        )
+        .order('created_at', { ascending: true })
+      if (showLoader) setLoadingChatMessages(false)
+
+      if (error) {
+        if (showLoader) Alert.alert('Chat unavailable', error.message)
         return
       }
 
-      try {
-        const parsed = JSON.parse(stored) as ChatMessage[]
-        setChatMessages(Array.isArray(parsed) ? parsed : [])
-      } catch {
-        setChatMessages([])
-      }
+      const mapped = ((data || []) as ChatMessageRow[]).map((row) => ({
+        id: row.id,
+        sender_name: row.sender_name,
+        text: row.message_text,
+        created_at: row.created_at,
+      }))
+      setChatMessages(mapped)
+
+      await supabase
+        .from('chat_messages')
+        .update({ read_at: new Date().toISOString() })
+        .ilike('receiver_name', currentName)
+        .ilike('sender_name', friendName)
+        .is('read_at', null)
+
+      await refreshUnreadCounts()
     }
 
-    void loadConversation()
-  }, [activeChatFriend?.name, currentProfileName, getChatStorageKey])
+    let isActive = true
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const bootstrap = async () => {
+      if (!isActive) return
+      await loadConversation(true)
+    }
+
+    void bootstrap()
+    timer = setInterval(() => {
+      if (!isActive) return
+      void loadConversation(false)
+    }, 3500)
+
+    return () => {
+      isActive = false
+      if (timer) clearInterval(timer)
+    }
+  }, [activeChatFriend?.name, currentProfileName, refreshUnreadCounts])
+
+  useEffect(() => {
+    if (!currentProfileName) {
+      setUnreadChatCount(0)
+      return
+    }
+
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const loadUnreadCount = async () => {
+      await refreshUnreadCounts()
+    }
+
+    void loadUnreadCount()
+    timer = setInterval(() => {
+      void loadUnreadCount()
+    }, 4500)
+
+    return () => {
+      if (timer) clearInterval(timer)
+    }
+  }, [currentProfileName, refreshUnreadCounts])
 
   const onSendChatMessage = async () => {
     const trimmed = chatDraft.trim()
     if (!trimmed || !activeChatFriend?.name || !currentProfileName) return
-
-    const nextMessage: ChatMessage = {
-      id: `${Date.now()}`,
-      text: trimmed,
-      sender_name: currentProfileName,
-      created_at: new Date().toISOString(),
+    if (!activeChatIsFriend) {
+      Alert.alert('Not allowed', 'Only accepted friends can send messages.')
+      return
     }
 
-    const nextMessages = [...chatMessages, nextMessage]
-    setChatMessages(nextMessages)
-    setChatDraft('')
+    setSendingChatMessage(true)
+    const senderName = currentProfileName.trim()
+    const receiverName = activeChatFriend.name.trim()
+    const { data, error } = await supabase
+      .from('chat_messages')
+      .insert({
+        sender_name: senderName,
+        receiver_name: receiverName,
+        message_text: trimmed,
+      })
+      .select('id, sender_name, receiver_name, message_text, created_at')
+      .single()
+    setSendingChatMessage(false)
 
-    const storageKey = getChatStorageKey(activeChatFriend.name)
-    if (!storageKey) return
-    await AsyncStorage.setItem(storageKey, JSON.stringify(nextMessages))
+    if (error) {
+      Alert.alert('Send failed', error.message)
+      return
+    }
+
+    const inserted = data as ChatMessageRow
+    setChatMessages((current) => [
+      ...current,
+      {
+        id: inserted.id,
+        sender_name: inserted.sender_name,
+        text: inserted.message_text,
+        created_at: inserted.created_at,
+      },
+    ])
+    setChatDraft('')
   }
 
   const tabContentTitle = useMemo(() => {
@@ -936,7 +1078,9 @@ export default function Dashboard() {
                 </View>
 
                 <View style={styles.messagesWrap}>
-                  {chatMessages.length === 0 ? (
+                  {loadingChatMessages ? (
+                    <Text style={styles.chatHintText}>Loading messages...</Text>
+                  ) : chatMessages.length === 0 ? (
                     <Text style={styles.chatHintText}>Start the conversation.</Text>
                   ) : (
                     chatMessages.map((message) => {
@@ -958,8 +1102,12 @@ export default function Dashboard() {
                     value={chatDraft}
                     onChangeText={setChatDraft}
                   />
-                  <Pressable style={styles.chatSendButton} onPress={() => void onSendChatMessage()}>
-                    <Text style={styles.chatSendButtonText}>Send</Text>
+                  <Pressable
+                    style={[styles.chatSendButton, sendingChatMessage ? styles.inviteButtonDisabled : null]}
+                    onPress={() => void onSendChatMessage()}
+                    disabled={sendingChatMessage}
+                  >
+                    <Text style={styles.chatSendButtonText}>{sendingChatMessage ? 'Sending...' : 'Send'}</Text>
                   </Pressable>
                 </View>
               </View>
@@ -1036,29 +1184,36 @@ export default function Dashboard() {
                 <View style={styles.friendsCard}>
                   <Text style={styles.friendsTitle}>Friends</Text>
                   {filteredFriendProfiles.map((friend) => (
-                    <Pressable
-                      key={friend.id}
-                      style={styles.friendRow}
-                      onPress={() => {
-                        setSelectedSearchProfile(null)
-                        setActiveChatFriend(friend)
-                      }}
-                    >
-                      <View style={styles.friendAvatarWrap}>
-                        {friend.pictures?.[0] ? (
-                          <Image source={{ uri: friend.pictures[0] }} style={styles.friendAvatarImage} />
-                        ) : (
-                          <Ionicons name="person-outline" size={16} color="#FF5864" />
-                        )}
-                      </View>
-                      <View style={styles.friendMain}>
-                        <Text style={styles.friendName}>{friend.name}</Text>
-                        <Text style={styles.friendMeta}>
-                          {friend.gender} | {friend.age}
-                        </Text>
-                      </View>
-                      <Ionicons name="chevron-forward" size={16} color="#9CA3AF" />
-                    </Pressable>
+                    (() => {
+                      const unreadForFriend = unreadByFriend[friend.name.trim().toLowerCase()] || 0
+                      return (
+                        <Pressable
+                          key={friend.id}
+                          style={styles.friendRow}
+                          onPress={() => openFriendChat(friend)}
+                        >
+                          <View style={styles.friendAvatarWrap}>
+                            {friend.pictures?.[0] ? (
+                              <Image source={{ uri: friend.pictures[0] }} style={styles.friendAvatarImage} />
+                            ) : (
+                              <Ionicons name="person-outline" size={16} color="#FF5864" />
+                            )}
+                          </View>
+                          <View style={styles.friendMain}>
+                            <Text style={styles.friendName}>{friend.name}</Text>
+                            <Text style={styles.friendMeta}>
+                              {friend.gender} | {friend.age}
+                            </Text>
+                          </View>
+                          {unreadForFriend > 0 ? (
+                            <View style={styles.friendUnreadBadge}>
+                              <Text style={styles.friendUnreadBadgeText}>{unreadForFriend > 99 ? '99+' : unreadForFriend}</Text>
+                            </View>
+                          ) : null}
+                          <Ionicons name="chevron-forward" size={16} color="#9CA3AF" />
+                        </Pressable>
+                      )
+                    })()
                   ))}
                   {filteredFriendProfiles.length === 0 ? (
                     <Text style={styles.searchStatusText}>No friends found.</Text>
@@ -1166,6 +1321,11 @@ export default function Dashboard() {
                 }}
               >
                 <Ionicons name={tab.icon} size={18} color={isActive ? '#FF5864' : '#9CA3AF'} />
+                {tab.key === 'chat' && visibleUnreadChatCount > 0 ? (
+                  <View style={styles.tabBadge}>
+                    <Text style={styles.tabBadgeText}>{visibleUnreadChatCount > 99 ? '99+' : visibleUnreadChatCount}</Text>
+                  </View>
+                ) : null}
                 <Text style={[styles.tabText, isActive ? styles.tabTextActive : null]}>{tab.label}</Text>
               </Pressable>
             )
@@ -1651,6 +1811,20 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#6B7280',
   },
+  friendUnreadBadge: {
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#FF5864',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 4,
+  },
+  friendUnreadBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '700',
+  },
   messagesWrap: {
     flex: 1,
     minHeight: 0,
@@ -1892,5 +2066,24 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+  },
+  tabBadge: {
+    position: 'absolute',
+    top: 2,
+    right: '32%',
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#FF5864',
+    borderWidth: 1,
+    borderColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  tabBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '700',
   },
 })

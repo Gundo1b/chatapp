@@ -137,3 +137,68 @@ for update
 to anon, authenticated
 using (true)
 with check (true);
+
+-- Chat messages table used by app/dashboard.tsx
+create table if not exists public.chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  sender_name text not null check (char_length(trim(sender_name)) > 0),
+  receiver_name text not null check (char_length(trim(receiver_name)) > 0),
+  message_text text not null check (char_length(trim(message_text)) > 0),
+  created_at timestamptz not null default now(),
+  read_at timestamptz
+);
+
+alter table public.chat_messages
+  add column if not exists read_at timestamptz;
+
+create index if not exists chat_messages_pair_created_idx
+  on public.chat_messages (sender_name, receiver_name, created_at);
+
+create index if not exists chat_messages_receiver_read_idx
+  on public.chat_messages (receiver_name, read_at);
+
+create or replace function public.ensure_chat_participants_are_friends()
+returns trigger
+language plpgsql
+as $$
+begin
+  if not exists (
+    select 1
+    from public.friend_requests fr
+    where fr.status = 'accepted'
+      and (
+        (lower(trim(fr.sender_name)) = lower(trim(new.sender_name))
+         and lower(trim(fr.receiver_name)) = lower(trim(new.receiver_name)))
+        or
+        (lower(trim(fr.sender_name)) = lower(trim(new.receiver_name))
+         and lower(trim(fr.receiver_name)) = lower(trim(new.sender_name)))
+      )
+  ) then
+    raise exception 'Only accepted friends can exchange messages';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists chat_messages_friends_only_trg on public.chat_messages;
+create trigger chat_messages_friends_only_trg
+before insert on public.chat_messages
+for each row
+execute function public.ensure_chat_participants_are_friends();
+
+alter table public.chat_messages enable row level security;
+
+drop policy if exists "Public can read chat messages" on public.chat_messages;
+create policy "Public can read chat messages"
+on public.chat_messages
+for select
+to anon, authenticated
+using (true);
+
+drop policy if exists "Public can insert chat messages" on public.chat_messages;
+create policy "Public can insert chat messages"
+on public.chat_messages
+for insert
+to anon, authenticated
+with check (true);
