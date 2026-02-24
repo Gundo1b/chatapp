@@ -80,3 +80,60 @@ on storage.objects
 for select
 to anon, authenticated
 using (bucket_id = 'profile-pictures');
+
+-- Friend requests table used by app/dashboard.tsx invite and bell badge logic
+create table if not exists public.friend_requests (
+  id uuid primary key default gen_random_uuid(),
+  sender_name text not null check (char_length(trim(sender_name)) > 0),
+  receiver_name text not null check (char_length(trim(receiver_name)) > 0),
+  status text not null default 'pending' check (status in ('pending', 'accepted', 'rejected')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint friend_requests_not_self check (lower(trim(sender_name)) <> lower(trim(receiver_name)))
+);
+
+create unique index if not exists friend_requests_sender_receiver_unique_idx
+  on public.friend_requests (sender_name, receiver_name);
+
+create index if not exists friend_requests_receiver_status_idx
+  on public.friend_requests (receiver_name, status);
+
+create or replace function public.touch_friend_requests_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists friend_requests_touch_updated_at_trg on public.friend_requests;
+create trigger friend_requests_touch_updated_at_trg
+before update on public.friend_requests
+for each row
+execute function public.touch_friend_requests_updated_at();
+
+alter table public.friend_requests enable row level security;
+
+drop policy if exists "Public can read friend requests" on public.friend_requests;
+create policy "Public can read friend requests"
+on public.friend_requests
+for select
+to anon, authenticated
+using (true);
+
+drop policy if exists "Public can insert friend requests" on public.friend_requests;
+create policy "Public can insert friend requests"
+on public.friend_requests
+for insert
+to anon, authenticated
+with check (true);
+
+drop policy if exists "Public can update friend requests" on public.friend_requests;
+create policy "Public can update friend requests"
+on public.friend_requests
+for update
+to anon, authenticated
+using (true)
+with check (true);

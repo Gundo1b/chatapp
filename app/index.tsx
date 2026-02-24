@@ -182,6 +182,10 @@ export default function Index() {
     setStep(2)
   }
 
+  const onGoToLogin = () => {
+    router.push('/login')
+  }
+
   const onSelectGender = (value: string) => {
     setGender(value)
     setStep(3)
@@ -340,6 +344,9 @@ export default function Index() {
               <LinearGradient colors={['#FD297B', '#FF655B']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.primaryButton}>
                 <Text style={styles.primaryButtonText}>Continue</Text>
               </LinearGradient>
+            </Pressable>
+            <Pressable onPress={onGoToLogin} style={styles.loginLinkWrap}>
+              <Text style={styles.loginLinkText}>Already have an account? Log in</Text>
             </Pressable>
           </>
         ) : null}
@@ -624,5 +631,14 @@ const styles = StyleSheet.create({
   },
   disabled: {
     opacity: 0.5,
+  },
+  loginLinkWrap: {
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  loginLinkText: {
+    fontSize: 14,
+    color: '#FF5864',
+    fontWeight: '600',
   },
 })

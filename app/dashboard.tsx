@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons'
-import { useEffect, useMemo, useState } from 'react'
-import { ActivityIndicator, Alert, Image, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ActivityIndicator, Alert, Image, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
 import { useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import AsyncStorage from '@react-native-async-storage/async-storage'
@@ -21,6 +21,20 @@ type SearchProfile = {
   age: number
   gender: string
   pictures: string[]
+}
+type IncomingInvite = {
+  id: string
+  sender_name: string
+  receiver_name: string
+  status: 'pending' | 'accepted' | 'rejected'
+  created_at: string
+  sender_profile?: SearchProfile | null
+}
+type ChatMessage = {
+  id: string
+  text: string
+  sender_name: string
+  created_at: string
 }
 const PHOTO_BUCKET = 'profile-pictures'
 const ACCOUNT_PICTURE_SLOTS = 3
@@ -75,7 +89,20 @@ export default function Dashboard() {
   const [selectedSearchProfile, setSelectedSearchProfile] = useState<SearchProfile | null>(null)
   const [sendingInvite, setSendingInvite] = useState(false)
   const [invitedProfileNames, setInvitedProfileNames] = useState<string[]>([])
+  const [friendProfileNames, setFriendProfileNames] = useState<string[]>([])
+  const [friendProfiles, setFriendProfiles] = useState<SearchProfile[]>([])
+  const [pendingInviteCount, setPendingInviteCount] = useState(0)
+  const [showInvitesPanel, setShowInvitesPanel] = useState(false)
+  const [incomingInvites, setIncomingInvites] = useState<IncomingInvite[]>([])
+  const [loadingIncomingInvites, setLoadingIncomingInvites] = useState(false)
+  const [processingInviteId, setProcessingInviteId] = useState<string | null>(null)
+  const [zoomImageUri, setZoomImageUri] = useState('')
+  const [activeChatFriend, setActiveChatFriend] = useState<SearchProfile | null>(null)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatDraft, setChatDraft] = useState('')
+  const [friendSearchQuery, setFriendSearchQuery] = useState('')
   const routeName = typeof params.name === 'string' ? params.name.trim() : ''
+  const currentProfileName = (storedProfile.name || routeName).trim()
 
   useEffect(() => {
     const routeAvatar = typeof params.avatar === 'string' ? params.avatar : ''
@@ -126,6 +153,210 @@ export default function Dashboard() {
 
     void syncPicturesFromDb()
   }, [avatarUri, routeName, storedProfile])
+
+  useEffect(() => {
+    if (!currentProfileName) {
+      setPendingInviteCount(0)
+      return
+    }
+
+    let isActive = true
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const loadPendingInvites = async () => {
+      const { count, error } = await supabase
+        .from('friend_requests')
+        .select('id', { count: 'exact', head: true })
+        .ilike('receiver_name', currentProfileName)
+        .eq('status', 'pending')
+
+      if (!isActive || error) return
+      setPendingInviteCount(count ?? 0)
+    }
+
+    void loadPendingInvites()
+    timer = setInterval(() => {
+      void loadPendingInvites()
+    }, 12000)
+
+    return () => {
+      isActive = false
+      if (timer) clearInterval(timer)
+    }
+  }, [currentProfileName])
+
+  const loadIncomingInvites = async () => {
+    if (!currentProfileName) {
+      setIncomingInvites([])
+      setPendingInviteCount(0)
+      return
+    }
+
+    setLoadingIncomingInvites(true)
+    const { data, error } = await supabase
+      .from('friend_requests')
+      .select('id, sender_name, receiver_name, status, created_at')
+      .ilike('receiver_name', currentProfileName)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+    setLoadingIncomingInvites(false)
+
+    if (error) {
+      Alert.alert('Invites unavailable', error.message)
+      return
+    }
+
+    const requestRows = (data || []) as IncomingInvite[]
+    const senderNames = Array.from(new Set(requestRows.map((row) => row.sender_name?.trim()).filter(Boolean)))
+
+    const senderProfilesByName = new Map<string, SearchProfile>()
+    if (senderNames.length > 0) {
+      const results = await Promise.all(
+        senderNames.map(async (senderName) => {
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id, name, age, gender, pictures')
+            .ilike('name', senderName)
+            .maybeSingle()
+          return profile as SearchProfile | null
+        }),
+      )
+
+      results.forEach((profile) => {
+        if (!profile?.name) return
+        senderProfilesByName.set(profile.name.trim().toLowerCase(), profile)
+      })
+    }
+
+    const rows = requestRows.map((row) => ({
+      ...row,
+      sender_profile: senderProfilesByName.get(row.sender_name.trim().toLowerCase()) || null,
+    }))
+    setIncomingInvites(rows)
+    setPendingInviteCount(rows.length)
+  }
+
+  useEffect(() => {
+    if (!currentProfileName) {
+      setInvitedProfileNames([])
+      return
+    }
+
+    let isActive = true
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const loadSentInvites = async () => {
+      const { data, error } = await supabase
+        .from('friend_requests')
+        .select('receiver_name')
+        .ilike('sender_name', currentProfileName)
+        .eq('status', 'pending')
+
+      if (!isActive || error) return
+
+      const nextInvitedNames = (data || [])
+        .map((row) => row.receiver_name?.trim().toLowerCase())
+        .filter((name): name is string => Boolean(name))
+
+      setInvitedProfileNames(nextInvitedNames)
+    }
+
+    void loadSentInvites()
+    timer = setInterval(() => {
+      void loadSentInvites()
+    }, 12000)
+
+    return () => {
+      isActive = false
+      if (timer) clearInterval(timer)
+    }
+  }, [currentProfileName])
+
+  useEffect(() => {
+    if (!currentProfileName) {
+      setFriendProfileNames([])
+      return
+    }
+
+    let isActive = true
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const loadFriends = async () => {
+      const [sentAccepted, receivedAccepted] = await Promise.all([
+        supabase
+          .from('friend_requests')
+          .select('receiver_name')
+          .ilike('sender_name', currentProfileName)
+          .eq('status', 'accepted'),
+        supabase
+          .from('friend_requests')
+          .select('sender_name')
+          .ilike('receiver_name', currentProfileName)
+          .eq('status', 'accepted'),
+      ])
+
+      if (!isActive || sentAccepted.error || receivedAccepted.error) return
+
+      const sentNames = (sentAccepted.data || [])
+        .map((row) => row.receiver_name?.trim().toLowerCase())
+        .filter((name): name is string => Boolean(name))
+      const receivedNames = (receivedAccepted.data || [])
+        .map((row) => row.sender_name?.trim().toLowerCase())
+        .filter((name): name is string => Boolean(name))
+
+      setFriendProfileNames(Array.from(new Set([...sentNames, ...receivedNames])))
+    }
+
+    void loadFriends()
+    timer = setInterval(() => {
+      void loadFriends()
+    }, 12000)
+
+    return () => {
+      isActive = false
+      if (timer) clearInterval(timer)
+    }
+  }, [currentProfileName])
+
+  useEffect(() => {
+    if (friendProfileNames.length === 0) {
+      setFriendProfiles([])
+      return
+    }
+
+    let isActive = true
+
+    const loadFriendProfiles = async () => {
+      const results = await Promise.all(
+        friendProfileNames.map(async (friendName) => {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, name, age, gender, pictures')
+            .ilike('name', friendName)
+            .maybeSingle()
+          return data as SearchProfile | null
+        }),
+      )
+
+      if (!isActive) return
+
+      const deduped = Array.from(
+        new Map(
+          results
+            .filter((profile): profile is SearchProfile => Boolean(profile?.id))
+            .map((profile) => [profile.id, profile]),
+        ).values(),
+      ).sort((a, b) => a.name.localeCompare(b.name))
+
+      setFriendProfiles(deduped)
+    }
+
+    void loadFriendProfiles()
+
+    return () => {
+      isActive = false
+    }
+  }, [friendProfileNames])
 
   useEffect(() => {
     const query = searchQuery.trim()
@@ -207,7 +438,10 @@ export default function Dashboard() {
   const displayAge = params.age || (storedProfile.age !== undefined ? String(storedProfile.age) : '-')
   const profilePictures = (storedProfile.pictures || []).filter((picture): picture is string => Boolean(picture))
   const selectedSearchPictures = (selectedSearchProfile?.pictures || []).filter((picture): picture is string => Boolean(picture))
-  const profileNameForDb = (storedProfile.name || routeName).trim()
+  const filteredFriendProfiles = friendProfiles.filter((friend) =>
+    friend.name.toLowerCase().includes(friendSearchQuery.trim().toLowerCase()),
+  )
+  const profileNameForDb = currentProfileName
   const accountPictureSlots = Array.from({ length: ACCOUNT_PICTURE_SLOTS }, (_, index) => profilePictures[index] || '')
 
   const uploadPictureToStorage = async (profileName: string, sourceUri: string, slot: number) => {
@@ -332,29 +566,151 @@ export default function Dashboard() {
       return
     }
 
-    setSendingInvite(true)
-    const { error } = await supabase.from('friend_requests').upsert(
-      {
-        sender_name: senderName,
-        receiver_name: receiverName,
-        status: 'pending',
-      },
-      { onConflict: 'sender_name,receiver_name' },
-    )
-    setSendingInvite(false)
-
-    if (error) {
-      Alert.alert('Invite failed', error.message)
+    if (friendProfileNames.includes(receiverKey)) {
+      Alert.alert('Already friends', 'You are already connected with this profile.')
       return
     }
 
-    setInvitedProfileNames((current) => (current.includes(receiverKey) ? current : [...current, receiverKey]))
-    Alert.alert('Invite sent', `Friend request sent to ${receiverName}.`)
+    setSendingInvite(true)
+    try {
+      const { error } = await supabase.from('friend_requests').upsert(
+        {
+          sender_name: senderName,
+          receiver_name: receiverName,
+          status: 'pending',
+        },
+        { onConflict: 'sender_name,receiver_name' },
+      )
+
+      if (error) {
+        Alert.alert('Invite failed', error.message)
+        return
+      }
+
+      setInvitedProfileNames((current) => (current.includes(receiverKey) ? current : [...current, receiverKey]))
+      Alert.alert('Invite sent', `Friend request sent to ${receiverName}.`)
+    } catch {
+      Alert.alert('Invite failed', 'Could not send invite right now.')
+    } finally {
+      setSendingInvite(false)
+    }
   }
 
   const selectedProfileIsInvited = selectedSearchProfile
     ? invitedProfileNames.includes(selectedSearchProfile.name.trim().toLowerCase())
     : false
+  const selectedProfileIsFriend = selectedSearchProfile
+    ? friendProfileNames.includes(selectedSearchProfile.name.trim().toLowerCase())
+    : false
+
+  const onOpenInvites = async () => {
+    setShowInvitesPanel(true)
+    setActiveTab('chat')
+    setSelectedSearchProfile(null)
+    await loadIncomingInvites()
+  }
+
+  const onRespondToInvite = async (inviteId: string, nextStatus: 'accepted' | 'rejected') => {
+    setProcessingInviteId(inviteId)
+    try {
+      const matchedInvite = incomingInvites.find((invite) => invite.id === inviteId)
+      const { error } = await supabase
+        .from('friend_requests')
+        .update({ status: nextStatus })
+        .eq('id', inviteId)
+
+      if (error) {
+        Alert.alert('Update failed', error.message)
+        return
+      }
+
+      setIncomingInvites((current) => current.filter((invite) => invite.id !== inviteId))
+      setPendingInviteCount((count) => Math.max(0, count - 1))
+
+      if (nextStatus === 'accepted') {
+        if (matchedInvite?.sender_name) {
+          const friendKey = matchedInvite.sender_name.trim().toLowerCase()
+          setFriendProfileNames((current) => (current.includes(friendKey) ? current : [...current, friendKey]))
+        }
+        setShowInvitesPanel(false)
+        setActiveTab('chat')
+        setSelectedSearchProfile(null)
+        if (matchedInvite?.sender_profile) {
+          setActiveChatFriend(matchedInvite.sender_profile)
+        }
+      }
+    } catch {
+      Alert.alert('Update failed', 'Could not update invite right now.')
+    } finally {
+      setProcessingInviteId(null)
+    }
+  }
+
+  const openZoom = (uri: string) => {
+    if (!uri) return
+    setZoomImageUri(uri)
+  }
+
+  const getChatStorageKey = useCallback(
+    (friendName: string) => {
+      const current = currentProfileName.trim().toLowerCase()
+      const friend = friendName.trim().toLowerCase()
+      if (!current || !friend) return ''
+      const sorted = [current, friend].sort()
+      return `chat_thread_${sorted[0]}_${sorted[1]}`
+    },
+    [currentProfileName],
+  )
+
+  useEffect(() => {
+    const loadConversation = async () => {
+      if (!activeChatFriend?.name) {
+        setChatMessages([])
+        return
+      }
+
+      const storageKey = getChatStorageKey(activeChatFriend.name)
+      if (!storageKey) {
+        setChatMessages([])
+        return
+      }
+
+      const stored = await AsyncStorage.getItem(storageKey)
+      if (!stored) {
+        setChatMessages([])
+        return
+      }
+
+      try {
+        const parsed = JSON.parse(stored) as ChatMessage[]
+        setChatMessages(Array.isArray(parsed) ? parsed : [])
+      } catch {
+        setChatMessages([])
+      }
+    }
+
+    void loadConversation()
+  }, [activeChatFriend?.name, currentProfileName, getChatStorageKey])
+
+  const onSendChatMessage = async () => {
+    const trimmed = chatDraft.trim()
+    if (!trimmed || !activeChatFriend?.name || !currentProfileName) return
+
+    const nextMessage: ChatMessage = {
+      id: `${Date.now()}`,
+      text: trimmed,
+      sender_name: currentProfileName,
+      created_at: new Date().toISOString(),
+    }
+
+    const nextMessages = [...chatMessages, nextMessage]
+    setChatMessages(nextMessages)
+    setChatDraft('')
+
+    const storageKey = getChatStorageKey(activeChatFriend.name)
+    if (!storageKey) return
+    await AsyncStorage.setItem(storageKey, JSON.stringify(nextMessages))
+  }
 
   const tabContentTitle = useMemo(() => {
     switch (activeTab) {
@@ -374,37 +730,61 @@ export default function Dashboard() {
   return (
     <View style={styles.container}>
       <View style={styles.card}>
-        <View style={styles.header}>
-          <Pressable style={styles.avatarWrap} onPress={onPickAvatar}>
-            {avatarUri ? (
-              <Image source={{ uri: avatarUri }} style={styles.avatarImage} />
-            ) : (
-              <Ionicons name="person" size={18} color="#FFFFFF" />
-            )}
-          </Pressable>
-          <View style={styles.headerTextWrap}>
-            <Text style={styles.title}>Hey, {displayName}</Text>
-            <Text style={styles.subtitle}>Ready to chat?</Text>
+        {activeTab !== 'chat' ? (
+          <View style={styles.header}>
+            <Pressable style={styles.avatarWrap} onPress={onPickAvatar}>
+              {avatarUri ? (
+                <Image source={{ uri: avatarUri }} style={styles.avatarImage} />
+              ) : (
+                <Ionicons name="person" size={18} color="#FFFFFF" />
+              )}
+            </Pressable>
+            <View style={styles.headerTextWrap}>
+              <Text style={styles.title}>Hey, {displayName}</Text>
+              <Text style={styles.subtitle}>Ready to chat?</Text>
+            </View>
+            <Pressable style={styles.headerAction} onPress={() => void onOpenInvites()}>
+              <Ionicons name="notifications-outline" size={20} color="#1E1E1E" />
+              {pendingInviteCount > 0 ? (
+                <View style={styles.notificationBadge}>
+                  <Text style={styles.notificationBadgeText}>{pendingInviteCount > 99 ? '99+' : pendingInviteCount}</Text>
+                </View>
+              ) : null}
+            </Pressable>
           </View>
-          <Pressable style={styles.headerAction}>
-            <Ionicons name="notifications-outline" size={20} color="#1E1E1E" />
-          </Pressable>
-        </View>
+        ) : null}
 
-        <View style={styles.searchBar}>
-          <Ionicons name="search-outline" size={16} color="#6B7280" />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search people"
-            placeholderTextColor="#9CA3AF"
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-        </View>
+        {activeTab !== 'chat' ? (
+          <View style={styles.searchBar}>
+            <Ionicons name="search-outline" size={16} color="#6B7280" />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search people"
+              placeholderTextColor="#9CA3AF"
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+          </View>
+        ) : null}
 
-        {searchQuery.trim() ? (
+        {activeTab === 'chat' && !showInvitesPanel && !activeChatFriend ? (
+          <View style={styles.searchBar}>
+            <Ionicons name="search-outline" size={16} color="#6B7280" />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search friends"
+              placeholderTextColor="#9CA3AF"
+              value={friendSearchQuery}
+              onChangeText={setFriendSearchQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+          </View>
+        ) : null}
+
+        {activeTab !== 'chat' && searchQuery.trim() ? (
           <View style={styles.searchResultsCard}>
             {searchingProfiles ? (
               <View style={styles.searchStatusRow}>
@@ -455,8 +835,135 @@ export default function Dashboard() {
         </View>
 
         <View style={styles.contentPanel}>
+          {showInvitesPanel ? (
+            <View style={styles.invitesCard}>
+              <View style={styles.invitesHeader}>
+                <Text style={styles.invitesTitle}>Invites</Text>
+                <Pressable onPress={() => setShowInvitesPanel(false)}>
+                  <Text style={styles.invitesClose}>Close</Text>
+                </Pressable>
+              </View>
+
+              {loadingIncomingInvites ? (
+                <View style={styles.searchStatusRow}>
+                  <ActivityIndicator size="small" color="#FF5864" />
+                  <Text style={styles.searchStatusText}>Loading invites...</Text>
+                </View>
+              ) : null}
+
+              {!loadingIncomingInvites && incomingInvites.length === 0 ? (
+                <Text style={styles.searchStatusText}>No pending invites.</Text>
+              ) : null}
+
+              {!loadingIncomingInvites && incomingInvites.length > 0
+                ? incomingInvites.map((invite) => (
+                    <View key={invite.id} style={styles.inviteRow}>
+                      <View style={styles.inviteTopRow}>
+                        <View style={styles.inviteAvatarWrap}>
+                          {invite.sender_profile?.pictures?.[0] ? (
+                            <Image source={{ uri: invite.sender_profile.pictures[0] }} style={styles.inviteAvatarImage} />
+                          ) : (
+                            <Ionicons name="person-outline" size={16} color="#FF5864" />
+                          )}
+                        </View>
+                        <View style={styles.inviteTextWrap}>
+                          <Text style={styles.inviteName}>{invite.sender_name}</Text>
+                          <Text style={styles.inviteMeta}>
+                            {invite.sender_profile?.gender || '-'} | {invite.sender_profile?.age ?? '-'}
+                          </Text>
+                        </View>
+                      </View>
+
+                      {invite.sender_profile?.pictures?.length ? (
+                        <View style={styles.invitePicturesRow}>
+                          {invite.sender_profile.pictures.slice(0, 3).map((uri, index) => (
+                            <Pressable key={`${invite.id}-${uri}-${index}`} style={styles.invitePictureTile} onPress={() => openZoom(uri)}>
+                              <Image source={{ uri }} style={styles.invitePictureImage} />
+                            </Pressable>
+                          ))}
+                        </View>
+                      ) : null}
+
+                      <View style={styles.inviteActions}>
+                        <Pressable
+                          style={styles.inviteAcceptButton}
+                          onPress={() => void onRespondToInvite(invite.id, 'accepted')}
+                          disabled={processingInviteId === invite.id}
+                        >
+                          <Text style={styles.inviteAcceptButtonText}>
+                            {processingInviteId === invite.id ? 'Saving...' : 'Accept'}
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.inviteDeclineButton}
+                          onPress={() => void onRespondToInvite(invite.id, 'rejected')}
+                          disabled={processingInviteId === invite.id}
+                        >
+                          <Text style={styles.inviteDeclineButtonText}>Decline</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  ))
+                : null}
+            </View>
+          ) : null}
+
           {activeTab === 'chat' ? (
-            selectedSearchProfile ? (
+            showInvitesPanel ? null : activeChatFriend ? (
+              <View style={[styles.searchProfileCard, styles.chatConversationCard]}>
+                <View style={styles.searchProfileHeader}>
+                  <Pressable style={styles.accountBack} onPress={() => setActiveChatFriend(null)}>
+                    <Ionicons name="chevron-back" size={16} color="#6B7280" />
+                    <Text style={styles.accountBackText}>Back</Text>
+                  </Pressable>
+                  <Text style={styles.accountTitle}>Chat</Text>
+                </View>
+
+                <View style={styles.searchProfileIdentity}>
+                  <View style={styles.searchProfileAvatar}>
+                    {activeChatFriend.pictures?.[0] ? (
+                      <Image source={{ uri: activeChatFriend.pictures[0] }} style={styles.searchProfileAvatarImage} />
+                    ) : (
+                      <Ionicons name="person-outline" size={26} color="#FF5864" />
+                    )}
+                  </View>
+                  <View style={styles.searchProfileTextWrap}>
+                    <Text style={styles.searchProfileName}>{activeChatFriend.name}</Text>
+                    <Text style={styles.searchProfileMeta}>
+                      {activeChatFriend.gender} | {activeChatFriend.age}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.messagesWrap}>
+                  {chatMessages.length === 0 ? (
+                    <Text style={styles.chatHintText}>Start the conversation.</Text>
+                  ) : (
+                    chatMessages.map((message) => {
+                      const isMine = message.sender_name.trim().toLowerCase() === currentProfileName.trim().toLowerCase()
+                      return (
+                        <View key={message.id} style={[styles.messageBubble, isMine ? styles.messageBubbleMine : styles.messageBubbleOther]}>
+                          <Text style={[styles.messageText, isMine ? styles.messageTextMine : null]}>{message.text}</Text>
+                        </View>
+                      )
+                    })
+                  )}
+                </View>
+
+                <View style={styles.chatComposer}>
+                  <TextInput
+                    style={styles.chatInput}
+                    placeholder="Type a message"
+                    placeholderTextColor="#9CA3AF"
+                    value={chatDraft}
+                    onChangeText={setChatDraft}
+                  />
+                  <Pressable style={styles.chatSendButton} onPress={() => void onSendChatMessage()}>
+                    <Text style={styles.chatSendButtonText}>Send</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : selectedSearchProfile ? (
               <View style={styles.searchProfileCard}>
                 <View style={styles.searchProfileHeader}>
                   <Pressable style={styles.accountBack} onPress={() => setSelectedSearchProfile(null)}>
@@ -482,34 +989,41 @@ export default function Dashboard() {
                   </View>
                 </View>
 
-                <Pressable
-                  style={[
-                    styles.inviteButton,
-                    sendingInvite || selectedProfileIsInvited ? styles.inviteButtonDisabled : null,
-                  ]}
-                  onPress={() => void onInviteProfile()}
-                  disabled={sendingInvite || selectedProfileIsInvited}
-                >
-                  <View style={styles.inviteButtonContent}>
-                    {selectedProfileIsInvited ? (
-                      <Ionicons name="checkmark-circle" size={15} color="#FFFFFF" />
-                    ) : null}
-                    <Text style={styles.inviteButtonText}>
-                      {sendingInvite
-                        ? 'Sending...'
-                        : selectedProfileIsInvited
-                          ? 'Request Sent'
-                          : 'Invite'}
-                    </Text>
+                {selectedProfileIsFriend ? (
+                  <View style={styles.friendPill}>
+                    <Ionicons name="checkmark-circle" size={15} color="#FFFFFF" />
+                    <Text style={styles.friendPillText}>Friends</Text>
                   </View>
-                </Pressable>
+                ) : (
+                  <Pressable
+                    style={[
+                      styles.inviteButton,
+                      sendingInvite || selectedProfileIsInvited ? styles.inviteButtonDisabled : null,
+                    ]}
+                    onPress={() => void onInviteProfile()}
+                    disabled={sendingInvite || selectedProfileIsInvited}
+                  >
+                    <View style={styles.inviteButtonContent}>
+                      {selectedProfileIsInvited ? (
+                        <Ionicons name="checkmark-circle" size={15} color="#FFFFFF" />
+                      ) : null}
+                      <Text style={styles.inviteButtonText}>
+                        {sendingInvite
+                          ? 'Sending...'
+                          : selectedProfileIsInvited
+                            ? 'Request Sent'
+                            : 'Invite'}
+                      </Text>
+                    </View>
+                  </Pressable>
+                )}
 
                 {selectedSearchPictures.length > 0 ? (
                   <View style={styles.picturesGrid}>
                     {selectedSearchPictures.map((uri, index) => (
-                      <View key={`${uri}-${index}`} style={styles.pictureTile}>
+                      <Pressable key={`${uri}-${index}`} style={styles.pictureTile} onPress={() => openZoom(uri)}>
                         <Image source={{ uri }} style={styles.pictureImage} />
-                      </View>
+                      </Pressable>
                     ))}
                   </View>
                 ) : (
@@ -518,17 +1032,46 @@ export default function Dashboard() {
               </View>
             ) : (
               <>
-              <View style={styles.storiesEmpty}>
-                <Ionicons name="book-outline" size={18} color="#9CA3AF" />
-                <Text style={styles.storiesEmptyTitle}>No stories yet</Text>
-                <Text style={styles.storiesEmptyText}>Stories from matches will appear here.</Text>
-              </View>
+              {friendProfiles.length > 0 ? (
+                <View style={styles.friendsCard}>
+                  <Text style={styles.friendsTitle}>Friends</Text>
+                  {filteredFriendProfiles.map((friend) => (
+                    <Pressable
+                      key={friend.id}
+                      style={styles.friendRow}
+                      onPress={() => {
+                        setSelectedSearchProfile(null)
+                        setActiveChatFriend(friend)
+                      }}
+                    >
+                      <View style={styles.friendAvatarWrap}>
+                        {friend.pictures?.[0] ? (
+                          <Image source={{ uri: friend.pictures[0] }} style={styles.friendAvatarImage} />
+                        ) : (
+                          <Ionicons name="person-outline" size={16} color="#FF5864" />
+                        )}
+                      </View>
+                      <View style={styles.friendMain}>
+                        <Text style={styles.friendName}>{friend.name}</Text>
+                        <Text style={styles.friendMeta}>
+                          {friend.gender} | {friend.age}
+                        </Text>
+                      </View>
+                      <Ionicons name="chevron-forward" size={16} color="#9CA3AF" />
+                    </Pressable>
+                  ))}
+                  {filteredFriendProfiles.length === 0 ? (
+                    <Text style={styles.searchStatusText}>No friends found.</Text>
+                  ) : null}
+                </View>
+              ) : (
+                <View style={styles.storiesEmpty}>
+                  <Ionicons name="people-outline" size={18} color="#9CA3AF" />
+                  <Text style={styles.storiesEmptyTitle}>No friends yet</Text>
+                  <Text style={styles.storiesEmptyText}>Accept invites to build your friends list.</Text>
+                </View>
+              )}
 
-              <View style={styles.chatEmpty}>
-                <Ionicons name="chatbubble-ellipses-outline" size={18} color="#9CA3AF" />
-                <Text style={styles.chatEmptyTitle}>No chats yet</Text>
-                <Text style={styles.chatEmptyText}>When you match with someone, messages will show here.</Text>
-              </View>
               </>
             )
           ) : null}
@@ -629,6 +1172,18 @@ export default function Dashboard() {
           })}
         </View>
       </View>
+
+      <Modal visible={Boolean(zoomImageUri)} transparent animationType="fade" onRequestClose={() => setZoomImageUri('')}>
+        <View style={styles.zoomBackdrop}>
+          <Pressable style={styles.zoomBackdropPress} onPress={() => setZoomImageUri('')} />
+          <View style={styles.zoomCard}>
+            {zoomImageUri ? <Image source={{ uri: zoomImageUri }} style={styles.zoomImage} resizeMode="contain" /> : null}
+            <Pressable style={styles.zoomCloseButton} onPress={() => setZoomImageUri('')}>
+              <Text style={styles.zoomCloseButtonText}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </View>
   )
 }
@@ -680,6 +1235,25 @@ const styles = StyleSheet.create({
     borderColor: '#E5E7EB',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  notificationBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -6,
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#FF5864',
+    borderWidth: 1,
+    borderColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  notificationBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '700',
   },
   title: {
     fontSize: 20,
@@ -794,6 +1368,158 @@ const styles = StyleSheet.create({
     padding: 12,
     gap: 12,
   },
+  chatConversationCard: {
+    flex: 1,
+    minHeight: 0,
+  },
+  invitesCard: {
+    marginTop: 2,
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    gap: 10,
+    marginBottom: 10,
+  },
+  invitesHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  invitesTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  invitesClose: {
+    fontSize: 13,
+    color: '#6B7280',
+    fontWeight: '600',
+  },
+  inviteRow: {
+    alignItems: 'stretch',
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    gap: 8,
+  },
+  inviteTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  inviteAvatarWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FFF1F3',
+    borderWidth: 1,
+    borderColor: '#FFD2D8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  inviteAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  inviteTextWrap: {
+    flex: 1,
+    gap: 2,
+  },
+  inviteName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  inviteMeta: {
+    fontSize: 12,
+    color: '#6B7280',
+  },
+  inviteActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    justifyContent: 'flex-end',
+  },
+  invitePicturesRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  invitePictureTile: {
+    width: 56,
+    height: 74,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#F3F4F6',
+  },
+  invitePictureImage: {
+    width: '100%',
+    height: '100%',
+  },
+  zoomBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(17, 24, 39, 0.88)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  zoomBackdropPress: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  zoomCard: {
+    width: '100%',
+    maxWidth: 520,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  zoomImage: {
+    width: '100%',
+    height: 420,
+    borderRadius: 14,
+  },
+  zoomCloseButton: {
+    marginTop: 14,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  zoomCloseButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  inviteAcceptButton: {
+    backgroundColor: '#16A34A',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  inviteAcceptButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  inviteDeclineButton: {
+    backgroundColor: '#E5E7EB',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  inviteDeclineButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#374151',
+  },
   searchProfileHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -851,6 +1577,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
   },
+  friendPill: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#16A34A',
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 999,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  friendPillText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
   storiesEmpty: {
     marginTop: 2,
     borderWidth: 1,
@@ -859,6 +1600,117 @@ const styles = StyleSheet.create({
     backgroundColor: '#FAFAFC',
     padding: 14,
     gap: 8,
+  },
+  friendsCard: {
+    marginTop: 2,
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    gap: 8,
+  },
+  friendsTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  friendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F3F4F6',
+    gap: 10,
+  },
+  friendAvatarWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#FFF1F3',
+    borderWidth: 1,
+    borderColor: '#FFD2D8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  friendAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  friendMain: {
+    flex: 1,
+    gap: 2,
+  },
+  friendName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  friendMeta: {
+    fontSize: 12,
+    color: '#6B7280',
+  },
+  messagesWrap: {
+    flex: 1,
+    minHeight: 0,
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    borderRadius: 12,
+    backgroundColor: '#FAFAFC',
+    padding: 10,
+    gap: 8,
+  },
+  chatHintText: {
+    fontSize: 13,
+    color: '#6B7280',
+  },
+  messageBubble: {
+    maxWidth: '82%',
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  messageBubbleMine: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#FF5864',
+  },
+  messageBubbleOther: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#E5E7EB',
+  },
+  messageText: {
+    fontSize: 13,
+    color: '#111827',
+  },
+  messageTextMine: {
+    color: '#FFFFFF',
+  },
+  chatComposer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 'auto',
+  },
+  chatInput: {
+    flex: 1,
+    backgroundColor: '#F3F4F6',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#111827',
+    fontSize: 14,
+  },
+  chatSendButton: {
+    backgroundColor: '#FF5864',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  chatSendButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
   },
   storiesEmptyTitle: {
     fontSize: 16,
