@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ActivityIndicator, Alert, Image, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ActivityIndicator, Alert, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import AsyncStorage from '@react-native-async-storage/async-storage'
@@ -44,7 +44,36 @@ type ChatMessageRow = {
   created_at: string
   read_at?: string | null
 }
+type InAppNotification = {
+  id: number
+  message: string
+}
+type StoryRow = {
+  id: string
+  author_name: string
+  author_avatar: string | null
+  text_content: string | null
+  image_url: string | null
+  created_at: string
+}
+type StoryLikeRow = {
+  story_id: string
+  user_name: string
+}
+type StoryCommentRow = {
+  id: string
+  story_id: string
+  user_name: string
+  comment_text: string
+  created_at: string
+}
+type StoryFeedItem = StoryRow & {
+  like_count: number
+  liked_by_me: boolean
+  comments: StoryCommentRow[]
+}
 const PHOTO_BUCKET = 'profile-pictures'
+const STORY_BUCKET = 'story-images'
 const ACCOUNT_PICTURE_SLOTS = 3
 
 const guessImageExtension = (uri: string) => {
@@ -96,6 +125,7 @@ export default function Dashboard() {
   const [searchError, setSearchError] = useState('')
   const [selectedSearchProfile, setSelectedSearchProfile] = useState<SearchProfile | null>(null)
   const [sendingInvite, setSendingInvite] = useState(false)
+  const [unfriending, setUnfriending] = useState(false)
   const [invitedProfileNames, setInvitedProfileNames] = useState<string[]>([])
   const [friendProfileNames, setFriendProfileNames] = useState<string[]>([])
   const [friendProfiles, setFriendProfiles] = useState<SearchProfile[]>([])
@@ -113,8 +143,34 @@ export default function Dashboard() {
   const [unreadChatCount, setUnreadChatCount] = useState(0)
   const [unreadByFriend, setUnreadByFriend] = useState<Record<string, number>>({})
   const [friendSearchQuery, setFriendSearchQuery] = useState('')
+  const [stories, setStories] = useState<StoryFeedItem[]>([])
+  const [loadingStories, setLoadingStories] = useState(false)
+  const [creatingStory, setCreatingStory] = useState(false)
+  const [storyTextDraft, setStoryTextDraft] = useState('')
+  const [storyImageDraft, setStoryImageDraft] = useState('')
+  const [storyCommentDrafts, setStoryCommentDrafts] = useState<Record<string, string>>({})
+  const [processingStoryLikeId, setProcessingStoryLikeId] = useState<string | null>(null)
+  const [postingCommentStoryId, setPostingCommentStoryId] = useState<string | null>(null)
+  const [inAppNotification, setInAppNotification] = useState<InAppNotification | null>(null)
+  const previousPendingInviteCountRef = useRef<number | null>(null)
+  const previousUnreadChatCountRef = useRef<number | null>(null)
+  const notificationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const routeName = typeof params.name === 'string' ? params.name.trim() : ''
   const currentProfileName = (storedProfile.name || routeName).trim()
+
+  const showInAppNotification = useCallback((message: string) => {
+    if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current)
+
+    setInAppNotification({
+      id: Date.now(),
+      message,
+    })
+
+    notificationTimerRef.current = setTimeout(() => {
+      setInAppNotification(null)
+      notificationTimerRef.current = null
+    }, 3200)
+  }, [])
 
   useEffect(() => {
     const routeAvatar = typeof params.avatar === 'string' ? params.avatar : ''
@@ -197,6 +253,12 @@ export default function Dashboard() {
     }
   }, [currentProfileName])
 
+  useEffect(() => {
+    return () => {
+      if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current)
+    }
+  }, [])
+
   const loadIncomingInvites = async () => {
     if (!currentProfileName) {
       setIncomingInvites([])
@@ -225,12 +287,29 @@ export default function Dashboard() {
     if (senderNames.length > 0) {
       const results = await Promise.all(
         senderNames.map(async (senderName) => {
-          const { data: profile } = await supabase
+          const normalizedSenderName = senderName.trim().toLowerCase()
+          const { data: exactProfile } = await supabase
             .from('profiles')
             .select('id, name, age, gender, pictures')
             .ilike('name', senderName)
             .maybeSingle()
-          return profile as SearchProfile | null
+
+          if (exactProfile?.name?.trim().toLowerCase() === normalizedSenderName) {
+            return exactProfile as SearchProfile
+          }
+
+          // Fallback for rows with inconsistent spacing/casing in existing data.
+          const { data: fallbackProfiles } = await supabase
+            .from('profiles')
+            .select('id, name, age, gender, pictures')
+            .ilike('name', `%${senderName}%`)
+            .limit(10)
+
+          const matchedFallback = (fallbackProfiles || []).find(
+            (profile) => profile?.name?.trim().toLowerCase() === normalizedSenderName,
+          )
+
+          return (matchedFallback as SearchProfile | undefined) || null
         }),
       )
 
@@ -337,25 +416,21 @@ export default function Dashboard() {
     }
 
     let isActive = true
+    let timer: ReturnType<typeof setInterval> | null = null
 
     const loadFriendProfiles = async () => {
-      const results = await Promise.all(
-        friendProfileNames.map(async (friendName) => {
-          const { data } = await supabase
-            .from('profiles')
-            .select('id, name, age, gender, pictures')
-            .ilike('name', friendName)
-            .maybeSingle()
-          return data as SearchProfile | null
-        }),
-      )
+      const friendNameSet = new Set(friendProfileNames.map((name) => name.trim().toLowerCase()))
+      const { data, error } = await supabase.from('profiles').select('id, name, age, gender, pictures').limit(500)
+
+      if (error || !data) return
 
       if (!isActive) return
 
       const deduped = Array.from(
         new Map(
-          results
-            .filter((profile): profile is SearchProfile => Boolean(profile?.id))
+          (data as SearchProfile[])
+            .filter((profile): profile is SearchProfile => Boolean(profile?.id && profile?.name))
+            .filter((profile) => friendNameSet.has(profile.name.trim().toLowerCase()))
             .map((profile) => [profile.id, profile]),
         ).values(),
       ).sort((a, b) => a.name.localeCompare(b.name))
@@ -364,14 +439,18 @@ export default function Dashboard() {
     }
 
     void loadFriendProfiles()
+    timer = setInterval(() => {
+      void loadFriendProfiles()
+    }, 12000)
 
     return () => {
       isActive = false
+      if (timer) clearInterval(timer)
     }
   }, [friendProfileNames])
 
   useEffect(() => {
-    const query = searchQuery.trim()
+    const query = (activeTab === 'chat' ? friendSearchQuery : searchQuery).trim()
     if (!query) {
       setSearchResults([])
       setSearchError('')
@@ -403,7 +482,7 @@ export default function Dashboard() {
     }, 350)
 
     return () => clearTimeout(timeoutId)
-  }, [routeName, searchQuery, storedProfile.name])
+  }, [activeTab, friendSearchQuery, routeName, searchQuery, storedProfile.name])
 
   const onPickAvatar = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
@@ -477,6 +556,190 @@ export default function Dashboard() {
     return data.publicUrl
   }
 
+  const uploadStoryImageToStorage = async (profileName: string, sourceUri: string) => {
+    const ext = guessImageExtension(sourceUri)
+    const contentType = contentTypeForExtension(ext)
+    const objectPath = `${sanitizePathSegment(profileName)}/${Date.now()}.${ext}`
+
+    const response = await fetch(sourceUri)
+    const blob = await response.blob()
+
+    const { error: uploadError } = await supabase.storage.from(STORY_BUCKET).upload(objectPath, blob, {
+      contentType,
+      upsert: false,
+    })
+
+    if (uploadError) {
+      throw new Error(uploadError.message)
+    }
+
+    const { data } = supabase.storage.from(STORY_BUCKET).getPublicUrl(objectPath)
+    return data.publicUrl
+  }
+
+  const loadStories = useCallback(async () => {
+    setLoadingStories(true)
+    const [{ data: storyRows, error: storyError }, { data: likeRows, error: likeError }, { data: commentRows, error: commentError }] =
+      await Promise.all([
+        supabase
+          .from('stories')
+          .select('id, author_name, author_avatar, text_content, image_url, created_at')
+          .order('created_at', { ascending: false })
+          .limit(50),
+        supabase.from('story_likes').select('story_id, user_name'),
+        supabase.from('story_comments').select('id, story_id, user_name, comment_text, created_at').order('created_at', { ascending: true }),
+      ])
+    setLoadingStories(false)
+
+    if (storyError || likeError || commentError) {
+      setStories([])
+      return
+    }
+
+    const myNameKey = currentProfileName.trim().toLowerCase()
+    const likes = (likeRows || []) as StoryLikeRow[]
+    const comments = (commentRows || []) as StoryCommentRow[]
+    const commentsByStory = new Map<string, StoryCommentRow[]>()
+    comments.forEach((comment) => {
+      const current = commentsByStory.get(comment.story_id) || []
+      current.push(comment)
+      commentsByStory.set(comment.story_id, current)
+    })
+
+    const nextStories = ((storyRows || []) as StoryRow[]).map((story) => {
+      const storyLikes = likes.filter((like) => like.story_id === story.id)
+      return {
+        ...story,
+        like_count: storyLikes.length,
+        liked_by_me: storyLikes.some((like) => like.user_name?.trim().toLowerCase() === myNameKey),
+        comments: commentsByStory.get(story.id) || [],
+      }
+    })
+
+    setStories(nextStories)
+  }, [currentProfileName])
+
+  const onPickStoryImage = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
+    if (!permission.granted) {
+      Alert.alert('Permission required', 'Please allow photo library access.')
+      return
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.82,
+      allowsEditing: true,
+      aspect: [4, 5],
+    })
+
+    if (result.canceled || !result.assets?.[0]?.uri) return
+    setStoryImageDraft(result.assets[0].uri)
+  }
+
+  const onCreateStory = async () => {
+    const trimmedText = storyTextDraft.trim()
+    if (!currentProfileName) {
+      Alert.alert('Missing profile', 'Please sign in again.')
+      return
+    }
+    if (!trimmedText && !storyImageDraft) {
+      Alert.alert('Empty story', 'Add text or image before posting.')
+      return
+    }
+
+    setCreatingStory(true)
+    try {
+      let imageUrl = ''
+      if (storyImageDraft) {
+        imageUrl = await uploadStoryImageToStorage(currentProfileName, storyImageDraft)
+      }
+
+      const { error } = await supabase.from('stories').insert({
+        author_name: currentProfileName,
+        author_avatar: avatarUri || null,
+        text_content: trimmedText || null,
+        image_url: imageUrl || null,
+      })
+
+      if (error) {
+        Alert.alert('Post failed', error.message)
+        return
+      }
+
+      setStoryTextDraft('')
+      setStoryImageDraft('')
+      await loadStories()
+      showInAppNotification('Story posted.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not create story.'
+      Alert.alert('Post failed', message)
+    } finally {
+      setCreatingStory(false)
+    }
+  }
+
+  const onToggleStoryLike = async (story: StoryFeedItem) => {
+    if (!currentProfileName) return
+    setProcessingStoryLikeId(story.id)
+
+    const myName = currentProfileName.trim()
+    try {
+      if (story.liked_by_me) {
+        const { error } = await supabase
+          .from('story_likes')
+          .delete()
+          .eq('story_id', story.id)
+          .ilike('user_name', myName)
+        if (error) {
+          Alert.alert('Like failed', error.message)
+          return
+        }
+      } else {
+        const { error } = await supabase.from('story_likes').insert({
+          story_id: story.id,
+          user_name: myName,
+        })
+        if (error) {
+          Alert.alert('Like failed', error.message)
+          return
+        }
+      }
+
+      await loadStories()
+    } finally {
+      setProcessingStoryLikeId(null)
+    }
+  }
+
+  const onPostStoryComment = async (storyId: string) => {
+    if (!currentProfileName) return
+    const draft = (storyCommentDrafts[storyId] || '').trim()
+    if (!draft) return
+
+    setPostingCommentStoryId(storyId)
+    try {
+      const { error } = await supabase.from('story_comments').insert({
+        story_id: storyId,
+        user_name: currentProfileName.trim(),
+        comment_text: draft,
+      })
+
+      if (error) {
+        Alert.alert('Comment failed', error.message)
+        return
+      }
+
+      setStoryCommentDrafts((current) => ({
+        ...current,
+        [storyId]: '',
+      }))
+      await loadStories()
+    } finally {
+      setPostingCommentStoryId(null)
+    }
+  }
+
   const onEditAccountPicture = async (slot: number) => {
     if (!profileNameForDb) {
       Alert.alert('Missing profile', 'Please register or sign in again.')
@@ -510,7 +773,8 @@ export default function Dashboard() {
         throw new Error(rowError.message)
       }
 
-      const basePictures = (row?.pictures || profilePictures).filter((picture): picture is string => Boolean(picture))
+      const rowPictures = Array.isArray(row?.pictures) ? (row.pictures as unknown[]) : []
+      const basePictures = (rowPictures.length ? rowPictures : profilePictures).filter((picture): picture is string => typeof picture === 'string')
       if (basePictures.length !== ACCOUNT_PICTURE_SLOTS) {
         throw new Error('Your profile must contain exactly 3 pictures before editing.')
       }
@@ -608,6 +872,76 @@ export default function Dashboard() {
     }
   }
 
+  const onUnfriendProfile = async () => {
+    if (!selectedSearchProfile) return
+    const currentName = profileNameForDb.trim()
+    const targetName = selectedSearchProfile.name.trim()
+    const targetKey = targetName.toLowerCase()
+
+    if (!currentName || !targetName) {
+      Alert.alert('Missing profile', 'Could not unfriend right now.')
+      return
+    }
+
+    setUnfriending(true)
+    try {
+      const [sentRowsRes, receivedRowsRes] = await Promise.all([
+        supabase
+          .from('friend_requests')
+          .select('id, sender_name, receiver_name')
+          .eq('status', 'accepted')
+          .ilike('sender_name', currentName)
+          .limit(50),
+        supabase
+          .from('friend_requests')
+          .select('id, sender_name, receiver_name')
+          .eq('status', 'accepted')
+          .ilike('receiver_name', currentName)
+          .limit(50),
+      ])
+
+      const readError = sentRowsRes.error || receivedRowsRes.error
+
+      if (readError) {
+        Alert.alert('Unfriend failed', readError.message)
+        return
+      }
+
+      const normalizedTarget = targetName.toLowerCase()
+      const sentMatches = (sentRowsRes.data || []).filter(
+        (row) => row.receiver_name?.trim().toLowerCase() === normalizedTarget,
+      )
+      const receivedMatches = (receivedRowsRes.data || []).filter(
+        (row) => row.sender_name?.trim().toLowerCase() === normalizedTarget,
+      )
+      const idsToDelete = Array.from(new Set([...sentMatches, ...receivedMatches].map((row) => row.id)))
+
+      if (idsToDelete.length === 0) {
+        Alert.alert('Unfriend failed', 'Friend relation not found in database.')
+        return
+      }
+
+      const { error: deleteError } = await supabase.from('friend_requests').delete().in('id', idsToDelete)
+      if (deleteError) {
+        Alert.alert('Unfriend failed', deleteError.message)
+        return
+      }
+
+      setFriendProfileNames((current) => current.filter((name) => name !== targetKey))
+      setFriendProfiles((current) => current.filter((profile) => profile.name.trim().toLowerCase() !== targetKey))
+      setInvitedProfileNames((current) => current.filter((name) => name !== targetKey))
+      setSelectedSearchProfile(null)
+      if (activeChatFriend?.name?.trim().toLowerCase() === targetKey) {
+        setActiveChatFriend(null)
+      }
+      Alert.alert('Removed', `${targetName} has been removed from friends.`)
+    } catch {
+      Alert.alert('Unfriend failed', 'Could not unfriend right now.')
+    } finally {
+      setUnfriending(false)
+    }
+  }
+
   const selectedProfileIsInvited = selectedSearchProfile
     ? invitedProfileNames.includes(selectedSearchProfile.name.trim().toLowerCase())
     : false
@@ -639,12 +973,17 @@ export default function Dashboard() {
     setSelectedSearchProfile(null)
     setActiveTab('chat')
     setActiveChatFriend(friend)
-    void supabase
-      .from('chat_messages')
-      .update({ read_at: new Date().toISOString() })
-      .ilike('receiver_name', currentProfileName.trim())
-      .ilike('sender_name', friend.name.trim())
-      .is('read_at', null)
+    const markThreadAsRead = async () => {
+      await supabase
+        .from('chat_messages')
+        .update({ read_at: new Date().toISOString() })
+        .ilike('receiver_name', currentProfileName.trim())
+        .ilike('sender_name', friend.name.trim())
+        .is('read_at', null)
+      await refreshUnreadCounts()
+    }
+
+    void markThreadAsRead()
   }
 
   const activeFriendUnreadCount = activeChatFriend
@@ -714,16 +1053,18 @@ export default function Dashboard() {
     if (error) return
 
     const rows = data || []
+    const friendNameSet = new Set(friendProfileNames.map((name) => name.trim().toLowerCase()))
     const nextByFriend: Record<string, number> = {}
     rows.forEach((row) => {
       const key = row.sender_name?.trim().toLowerCase()
       if (!key) return
+      if (!friendNameSet.has(key)) return
       nextByFriend[key] = (nextByFriend[key] || 0) + 1
     })
 
     setUnreadByFriend(nextByFriend)
-    setUnreadChatCount(rows.length)
-  }, [currentProfileName])
+    setUnreadChatCount(Object.values(nextByFriend).reduce((sum, count) => sum + count, 0))
+  }, [currentProfileName, friendProfileNames])
 
   useEffect(() => {
     const loadConversation = async (showLoader: boolean) => {
@@ -793,6 +1134,16 @@ export default function Dashboard() {
   }, [activeChatFriend?.name, currentProfileName, refreshUnreadCounts])
 
   useEffect(() => {
+    if (friendProfileNames.length === 0) {
+      setUnreadByFriend({})
+      setUnreadChatCount(0)
+      return
+    }
+
+    void refreshUnreadCounts()
+  }, [friendProfileNames, refreshUnreadCounts])
+
+  useEffect(() => {
     if (!currentProfileName) {
       setUnreadChatCount(0)
       return
@@ -813,6 +1164,83 @@ export default function Dashboard() {
       if (timer) clearInterval(timer)
     }
   }, [currentProfileName, refreshUnreadCounts])
+
+  useEffect(() => {
+    const previousCount = previousPendingInviteCountRef.current
+    if (previousCount === null) {
+      previousPendingInviteCountRef.current = pendingInviteCount
+      return
+    }
+
+    if (pendingInviteCount > previousCount) {
+      const added = pendingInviteCount - previousCount
+      showInAppNotification(added === 1 ? 'New friend request received.' : `${added} new friend requests received.`)
+    }
+
+    previousPendingInviteCountRef.current = pendingInviteCount
+  }, [pendingInviteCount, showInAppNotification])
+
+  useEffect(() => {
+    const previousCount = previousUnreadChatCountRef.current
+    if (previousCount === null) {
+      previousUnreadChatCountRef.current = unreadChatCount
+      return
+    }
+
+    if (unreadChatCount > previousCount) {
+      const added = unreadChatCount - previousCount
+      showInAppNotification(added === 1 ? 'New message received.' : `${added} new messages received.`)
+    }
+
+    previousUnreadChatCountRef.current = unreadChatCount
+  }, [showInAppNotification, unreadChatCount])
+
+  useEffect(() => {
+    if (activeTab !== 'stories') return
+
+    let isActive = true
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const bootstrap = async () => {
+      if (!isActive) return
+      await loadStories()
+    }
+
+    void bootstrap()
+    timer = setInterval(() => {
+      if (!isActive) return
+      void loadStories()
+    }, 6000)
+
+    return () => {
+      isActive = false
+      if (timer) clearInterval(timer)
+    }
+  }, [activeTab, loadStories])
+
+  useEffect(() => {
+    if (activeTab !== 'chat' || !currentProfileName) return
+
+    let isActive = true
+    const markAllAsReadOnChatOpen = async () => {
+      const nowIso = new Date().toISOString()
+      await supabase
+        .from('chat_messages')
+        .update({ read_at: nowIso })
+        .ilike('receiver_name', currentProfileName.trim())
+        .is('read_at', null)
+
+      if (!isActive) return
+      setUnreadByFriend({})
+      setUnreadChatCount(0)
+    }
+
+    void markAllAsReadOnChatOpen()
+
+    return () => {
+      isActive = false
+    }
+  }, [activeTab, currentProfileName])
 
   const onSendChatMessage = async () => {
     const trimmed = chatDraft.trim()
@@ -872,29 +1300,34 @@ export default function Dashboard() {
   return (
     <View style={styles.container}>
       <View style={styles.card}>
-        {activeTab !== 'chat' ? (
-          <View style={styles.header}>
-            <Pressable style={styles.avatarWrap} onPress={onPickAvatar}>
-              {avatarUri ? (
-                <Image source={{ uri: avatarUri }} style={styles.avatarImage} />
-              ) : (
-                <Ionicons name="person" size={18} color="#FFFFFF" />
-              )}
-            </Pressable>
-            <View style={styles.headerTextWrap}>
-              <Text style={styles.title}>Hey, {displayName}</Text>
-              <Text style={styles.subtitle}>Ready to chat?</Text>
-            </View>
-            <Pressable style={styles.headerAction} onPress={() => void onOpenInvites()}>
-              <Ionicons name="notifications-outline" size={20} color="#1E1E1E" />
-              {pendingInviteCount > 0 ? (
-                <View style={styles.notificationBadge}>
-                  <Text style={styles.notificationBadgeText}>{pendingInviteCount > 99 ? '99+' : pendingInviteCount}</Text>
-                </View>
-              ) : null}
-            </Pressable>
+        {inAppNotification ? (
+          <View key={inAppNotification.id} style={styles.inAppNotice}>
+            <Ionicons name="notifications" size={14} color="#FFFFFF" />
+            <Text style={styles.inAppNoticeText}>{inAppNotification.message}</Text>
           </View>
         ) : null}
+
+        <View style={styles.header}>
+          <Pressable style={styles.avatarWrap} onPress={onPickAvatar}>
+            {avatarUri ? (
+              <Image source={{ uri: avatarUri }} style={styles.avatarImage} />
+            ) : (
+              <Ionicons name="person" size={18} color="#FFFFFF" />
+            )}
+          </Pressable>
+          <View style={styles.headerTextWrap}>
+            <Text style={styles.title}>Hey, {displayName}</Text>
+            <Text style={styles.subtitle}>Ready to chat?</Text>
+          </View>
+          <Pressable style={styles.headerAction} onPress={() => void onOpenInvites()}>
+            <Ionicons name="notifications-outline" size={20} color="#1E1E1E" />
+            {pendingInviteCount > 0 ? (
+              <View style={styles.notificationBadge}>
+                <Text style={styles.notificationBadgeText}>{pendingInviteCount > 99 ? '99+' : pendingInviteCount}</Text>
+              </View>
+            ) : null}
+          </Pressable>
+        </View>
 
         {activeTab !== 'chat' ? (
           <View style={styles.searchBar}>
@@ -916,7 +1349,7 @@ export default function Dashboard() {
             <Ionicons name="search-outline" size={16} color="#6B7280" />
             <TextInput
               style={styles.searchInput}
-              placeholder="Search friends"
+              placeholder="Search friends or people"
               placeholderTextColor="#9CA3AF"
               value={friendSearchQuery}
               onChangeText={setFriendSearchQuery}
@@ -926,7 +1359,7 @@ export default function Dashboard() {
           </View>
         ) : null}
 
-        {activeTab !== 'chat' && searchQuery.trim() ? (
+        {(activeTab === 'chat' ? friendSearchQuery.trim() : searchQuery.trim()) ? (
           <View style={styles.searchResultsCard}>
             {searchingProfiles ? (
               <View style={styles.searchStatusRow}>
@@ -948,6 +1381,7 @@ export default function Dashboard() {
                     style={styles.searchResultItem}
                     onPress={() => {
                       setSelectedSearchProfile(person)
+                      setFriendSearchQuery('')
                       setSearchQuery('')
                       setSearchResults([])
                     }}
@@ -1138,9 +1572,18 @@ export default function Dashboard() {
                 </View>
 
                 {selectedProfileIsFriend ? (
-                  <View style={styles.friendPill}>
-                    <Ionicons name="checkmark-circle" size={15} color="#FFFFFF" />
-                    <Text style={styles.friendPillText}>Friends</Text>
+                  <View style={styles.friendActionWrap}>
+                    <View style={styles.friendPill}>
+                      <Ionicons name="checkmark-circle" size={15} color="#FFFFFF" />
+                      <Text style={styles.friendPillText}>Friends</Text>
+                    </View>
+                    <Pressable
+                      style={[styles.unfriendButton, unfriending ? styles.inviteButtonDisabled : null]}
+                      onPress={() => void onUnfriendProfile()}
+                      disabled={unfriending}
+                    >
+                      <Text style={styles.unfriendButtonText}>{unfriending ? 'Removing...' : 'Unfriend'}</Text>
+                    </Pressable>
                   </View>
                 ) : (
                   <Pressable
@@ -1232,11 +1675,123 @@ export default function Dashboard() {
           ) : null}
 
           {activeTab === 'stories' ? (
-            <View style={styles.placeholderCard}>
-              <Ionicons name="book-outline" size={20} color="#FF5864" />
-              <Text style={styles.placeholderTitle}>Stories Feed</Text>
-              <Text style={styles.placeholderText}>Create and browse short updates from your matches.</Text>
-            </View>
+            <ScrollView style={styles.storiesWrap} contentContainerStyle={styles.storiesContent} showsVerticalScrollIndicator={false}>
+              <View style={styles.storyComposerCard}>
+                <Text style={styles.storyComposerTitle}>Create Story</Text>
+                <TextInput
+                  style={styles.storyComposerInput}
+                  placeholder="Write something..."
+                  placeholderTextColor="#9CA3AF"
+                  value={storyTextDraft}
+                  onChangeText={setStoryTextDraft}
+                  multiline
+                />
+                {storyImageDraft ? (
+                  <View style={styles.storyDraftImageWrap}>
+                    <Image source={{ uri: storyImageDraft }} style={styles.storyDraftImage} />
+                    <Pressable style={styles.storyDraftRemove} onPress={() => setStoryImageDraft('')}>
+                      <Text style={styles.storyDraftRemoveText}>Remove image</Text>
+                    </Pressable>
+                  </View>
+                ) : null}
+                <View style={styles.storyComposerActions}>
+                  <Pressable style={styles.storyGhostButton} onPress={() => void onPickStoryImage()}>
+                    <Ionicons name="image-outline" size={15} color="#374151" />
+                    <Text style={styles.storyGhostButtonText}>{storyImageDraft ? 'Change image' : 'Add image'}</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.storyPrimaryButton, creatingStory ? styles.inviteButtonDisabled : null]}
+                    onPress={() => void onCreateStory()}
+                    disabled={creatingStory}
+                  >
+                    <Text style={styles.storyPrimaryButtonText}>{creatingStory ? 'Posting...' : 'Post story'}</Text>
+                  </Pressable>
+                </View>
+              </View>
+
+              {loadingStories ? (
+                <View style={styles.searchStatusRow}>
+                  <ActivityIndicator size="small" color="#FF5864" />
+                  <Text style={styles.searchStatusText}>Loading stories...</Text>
+                </View>
+              ) : null}
+
+              {!loadingStories && stories.length === 0 ? (
+                <View style={styles.placeholderCard}>
+                  <Ionicons name="book-outline" size={20} color="#FF5864" />
+                  <Text style={styles.placeholderTitle}>No stories yet</Text>
+                  <Text style={styles.placeholderText}>Be the first to post a story.</Text>
+                </View>
+              ) : null}
+
+              {!loadingStories
+                ? stories.map((story) => (
+                    <View key={story.id} style={styles.storyCard}>
+                      <View style={styles.storyHeader}>
+                        <View style={styles.storyAvatar}>
+                          {story.author_avatar ? (
+                            <Image source={{ uri: story.author_avatar }} style={styles.storyAvatarImage} />
+                          ) : (
+                            <Ionicons name="person-outline" size={16} color="#FF5864" />
+                          )}
+                        </View>
+                        <View style={styles.storyHeaderText}>
+                          <Text style={styles.storyAuthor}>{story.author_name}</Text>
+                          <Text style={styles.storyDate}>{new Date(story.created_at).toLocaleString()}</Text>
+                        </View>
+                      </View>
+
+                      {story.text_content ? <Text style={styles.storyText}>{story.text_content}</Text> : null}
+                      {story.image_url ? <Image source={{ uri: story.image_url }} style={styles.storyImage} /> : null}
+
+                      <View style={styles.storyStats}>
+                        <Text style={styles.storyStatText}>{story.like_count} likes</Text>
+                        <Text style={styles.storyStatText}>{story.comments.length} comments</Text>
+                      </View>
+
+                      <View style={styles.storyActionRow}>
+                        <Pressable
+                          style={[styles.storyGhostButton, processingStoryLikeId === story.id ? styles.inviteButtonDisabled : null]}
+                          onPress={() => void onToggleStoryLike(story)}
+                          disabled={processingStoryLikeId === story.id}
+                        >
+                          <Ionicons name={story.liked_by_me ? 'heart' : 'heart-outline'} size={15} color={story.liked_by_me ? '#DC2626' : '#374151'} />
+                          <Text style={styles.storyGhostButtonText}>{story.liked_by_me ? 'Liked' : 'Like'}</Text>
+                        </Pressable>
+                      </View>
+
+                      {story.comments.map((comment) => (
+                        <View key={comment.id} style={styles.storyCommentRow}>
+                          <Text style={styles.storyCommentAuthor}>{comment.user_name}:</Text>
+                          <Text style={styles.storyCommentText}>{comment.comment_text}</Text>
+                        </View>
+                      ))}
+
+                      <View style={styles.storyCommentComposer}>
+                        <TextInput
+                          style={styles.storyCommentInput}
+                          placeholder="Write a comment"
+                          placeholderTextColor="#9CA3AF"
+                          value={storyCommentDrafts[story.id] || ''}
+                          onChangeText={(value) =>
+                            setStoryCommentDrafts((current) => ({
+                              ...current,
+                              [story.id]: value,
+                            }))
+                          }
+                        />
+                        <Pressable
+                          style={[styles.storyCommentSend, postingCommentStoryId === story.id ? styles.inviteButtonDisabled : null]}
+                          onPress={() => void onPostStoryComment(story.id)}
+                          disabled={postingCommentStoryId === story.id}
+                        >
+                          <Text style={styles.storyCommentSendText}>{postingCommentStoryId === story.id ? '...' : 'Send'}</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  ))
+                : null}
+            </ScrollView>
           ) : null}
 
           {activeTab === 'ai' ? (
@@ -1364,6 +1919,22 @@ const styles = StyleSheet.create({
     paddingTop: 16,
     paddingHorizontal: 14,
     paddingBottom: 10,
+  },
+  inAppNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#111827',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  inAppNoticeText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '600',
+    flex: 1,
   },
   header: {
     flexDirection: 'row',
@@ -1752,6 +2323,22 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
   },
+  friendActionWrap: {
+    gap: 8,
+    alignItems: 'flex-start',
+  },
+  unfriendButton: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#DC2626',
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 999,
+  },
+  unfriendButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
   storiesEmpty: {
     marginTop: 2,
     borderWidth: 1,
@@ -1895,6 +2482,204 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#6B7280',
     lineHeight: 20,
+  },
+  storiesWrap: {
+    flex: 1,
+  },
+  storiesContent: {
+    paddingBottom: 12,
+    gap: 10,
+  },
+  storyComposerCard: {
+    marginTop: 2,
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    gap: 8,
+  },
+  storyComposerTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  storyComposerInput: {
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 12,
+    backgroundColor: '#FAFAFC',
+    color: '#111827',
+    fontSize: 14,
+    minHeight: 88,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    textAlignVertical: 'top',
+  },
+  storyDraftImageWrap: {
+    gap: 6,
+  },
+  storyDraftImage: {
+    width: '100%',
+    height: 180,
+    borderRadius: 12,
+    backgroundColor: '#F3F4F6',
+  },
+  storyDraftRemove: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    backgroundColor: '#FFFFFF',
+  },
+  storyDraftRemoveText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#374151',
+  },
+  storyComposerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  storyGhostButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: '#FFFFFF',
+  },
+  storyGhostButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#374151',
+  },
+  storyPrimaryButton: {
+    backgroundColor: '#FF5864',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  storyPrimaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  storyCard: {
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    gap: 8,
+  },
+  storyHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  storyAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: '#FFD2D8',
+    backgroundColor: '#FFF1F3',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  storyAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  storyHeaderText: {
+    flex: 1,
+    gap: 1,
+  },
+  storyAuthor: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  storyDate: {
+    fontSize: 11,
+    color: '#6B7280',
+  },
+  storyText: {
+    fontSize: 14,
+    color: '#111827',
+    lineHeight: 20,
+  },
+  storyImage: {
+    width: '100%',
+    height: 220,
+    borderRadius: 12,
+    backgroundColor: '#F3F4F6',
+  },
+  storyStats: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  storyStatText: {
+    fontSize: 12,
+    color: '#6B7280',
+  },
+  storyActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+  },
+  storyCommentRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 6,
+  },
+  storyCommentAuthor: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  storyCommentText: {
+    flex: 1,
+    fontSize: 12,
+    color: '#374151',
+    lineHeight: 17,
+  },
+  storyCommentComposer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  storyCommentInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 12,
+    backgroundColor: '#FAFAFC',
+    color: '#111827',
+    fontSize: 13,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  storyCommentSend: {
+    backgroundColor: '#111827',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  storyCommentSendText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
   },
   chatEmpty: {
     marginTop: 12,

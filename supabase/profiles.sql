@@ -29,7 +29,7 @@ begin
   end if;
 
   if new.password_hash not like '$2%' then
-    new.password_hash := crypt(new.password_hash, gen_salt('bf'));
+    new.password_hash := extensions.crypt(new.password_hash, extensions.gen_salt('bf'));
   end if;
 
   return new;
@@ -41,6 +41,29 @@ create trigger profiles_hash_password_trg
 before insert or update of password_hash on public.profiles
 for each row
 execute function public.hash_profile_password();
+
+create or replace function public.verify_profile_login(p_name text, p_password text)
+returns table (
+  name text,
+  gender text,
+  age integer,
+  pictures text[]
+)
+language sql
+security definer
+set search_path = public
+as $$
+  select p.name, p.gender, p.age, p.pictures
+  from public.profiles p
+  where lower(trim(p.name)) = lower(trim(p_name))
+    and (
+      p.password_hash = p_password
+      or p.password_hash = extensions.crypt(p_password, p.password_hash)
+    )
+  limit 1;
+$$;
+
+grant execute on function public.verify_profile_login(text, text) to anon, authenticated;
 
 alter table public.profiles enable row level security;
 
@@ -137,6 +160,125 @@ for update
 to anon, authenticated
 using (true)
 with check (true);
+
+drop policy if exists "Public can delete friend requests" on public.friend_requests;
+create policy "Public can delete friend requests"
+on public.friend_requests
+for delete
+to anon, authenticated
+using (true);
+
+-- Stories feed tables
+create table if not exists public.stories (
+  id uuid primary key default gen_random_uuid(),
+  author_name text not null check (char_length(trim(author_name)) > 0),
+  author_avatar text,
+  text_content text,
+  image_url text,
+  created_at timestamptz not null default now(),
+  constraint stories_content_required check (
+    coalesce(char_length(trim(text_content)), 0) > 0
+    or coalesce(char_length(trim(image_url)), 0) > 0
+  )
+);
+
+create index if not exists stories_created_at_idx
+  on public.stories (created_at desc);
+
+alter table public.stories enable row level security;
+
+drop policy if exists "Public can read stories" on public.stories;
+create policy "Public can read stories"
+on public.stories
+for select
+to anon, authenticated
+using (true);
+
+drop policy if exists "Public can insert stories" on public.stories;
+create policy "Public can insert stories"
+on public.stories
+for insert
+to anon, authenticated
+with check (true);
+
+create table if not exists public.story_likes (
+  story_id uuid not null references public.stories(id) on delete cascade,
+  user_name text not null check (char_length(trim(user_name)) > 0),
+  created_at timestamptz not null default now(),
+  primary key (story_id, user_name)
+);
+
+create index if not exists story_likes_story_id_idx
+  on public.story_likes (story_id);
+
+alter table public.story_likes enable row level security;
+
+drop policy if exists "Public can read story likes" on public.story_likes;
+create policy "Public can read story likes"
+on public.story_likes
+for select
+to anon, authenticated
+using (true);
+
+drop policy if exists "Public can insert story likes" on public.story_likes;
+create policy "Public can insert story likes"
+on public.story_likes
+for insert
+to anon, authenticated
+with check (true);
+
+drop policy if exists "Public can delete story likes" on public.story_likes;
+create policy "Public can delete story likes"
+on public.story_likes
+for delete
+to anon, authenticated
+using (true);
+
+create table if not exists public.story_comments (
+  id uuid primary key default gen_random_uuid(),
+  story_id uuid not null references public.stories(id) on delete cascade,
+  user_name text not null check (char_length(trim(user_name)) > 0),
+  comment_text text not null check (char_length(trim(comment_text)) > 0),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists story_comments_story_id_idx
+  on public.story_comments (story_id, created_at);
+
+alter table public.story_comments enable row level security;
+
+drop policy if exists "Public can read story comments" on public.story_comments;
+create policy "Public can read story comments"
+on public.story_comments
+for select
+to anon, authenticated
+using (true);
+
+drop policy if exists "Public can insert story comments" on public.story_comments;
+create policy "Public can insert story comments"
+on public.story_comments
+for insert
+to anon, authenticated
+with check (true);
+
+-- Storage bucket for story images
+insert into storage.buckets (id, name, public)
+values ('story-images', 'story-images', true)
+on conflict (id) do nothing;
+
+drop policy if exists "Public can upload story images" on storage.objects;
+create policy "Public can upload story images"
+on storage.objects
+for insert
+to anon, authenticated
+with check (bucket_id = 'story-images');
+
+drop policy if exists "Public can read story images" on storage.objects;
+create policy "Public can read story images"
+on storage.objects
+for select
+to anon, authenticated
+using (bucket_id = 'story-images');
 
 -- Chat messages table used by app/dashboard.tsx
 create table if not exists public.chat_messages (

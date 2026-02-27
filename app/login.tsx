@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
+import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native'
 import { LinearGradient } from 'expo-linear-gradient'
 import { useRouter } from 'expo-router'
 import AsyncStorage from '@react-native-async-storage/async-storage'
@@ -18,6 +18,7 @@ export default function Login() {
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [checkingSession, setCheckingSession] = useState(true)
+  const [errorMessage, setErrorMessage] = useState('')
 
   useEffect(() => {
     const bootstrapSession = async () => {
@@ -53,31 +54,34 @@ export default function Login() {
   const onLogin = async () => {
     const trimmedName = name.trim()
     const trimmedPassword = password.trim()
+    setErrorMessage('')
+
     if (!trimmedName || !trimmedPassword) {
+      setErrorMessage('Enter your name and password.')
       Alert.alert('Missing fields', 'Enter your name and password.')
       return
     }
 
     setLoading(true)
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('name, gender, age, pictures')
-        .eq('name', trimmedName)
-        .eq('password_hash', trimmedPassword)
-        .maybeSingle()
+      const { data, error } = await supabase.rpc('verify_profile_login', {
+        p_name: trimmedName,
+        p_password: trimmedPassword,
+      })
 
       if (error) {
+        setErrorMessage(error.message)
         Alert.alert('Login failed', error.message)
         return
       }
 
-      if (!data) {
+      if (!Array.isArray(data) || data.length === 0) {
+        setErrorMessage('Name or password is incorrect.')
         Alert.alert('Invalid credentials', 'Name or password is incorrect.')
         return
       }
 
-      const profile = data as ProfileRow
+      const profile = data[0] as ProfileRow
       const avatar = profile.pictures?.[0] || ''
 
       await AsyncStorage.setItem(
@@ -101,6 +105,7 @@ export default function Login() {
         },
       })
     } catch {
+      setErrorMessage('Could not reach the server. Please try again.')
       Alert.alert('Login failed', 'Could not reach the server. Please try again.')
     } finally {
       setLoading(false)
@@ -142,11 +147,13 @@ export default function Login() {
           style={styles.input}
         />
 
-        <Pressable onPress={onLogin} disabled={loading} style={loading ? styles.disabled : undefined}>
+        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+
+        <TouchableOpacity activeOpacity={0.9} onPress={() => void onLogin()} disabled={loading} style={loading ? styles.disabled : undefined}>
           <LinearGradient colors={['#FD297B', '#FF655B']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.primaryButton}>
             <Text style={styles.primaryButtonText}>{loading ? 'Logging in...' : 'Log in'}</Text>
           </LinearGradient>
-        </Pressable>
+        </TouchableOpacity>
 
         <Pressable onPress={() => router.replace('/')} style={styles.linkWrap}>
           <Text style={styles.linkText}>Need an account? Register</Text>
@@ -191,6 +198,11 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     color: '#1E1E1E',
     fontSize: 16,
+  },
+  errorText: {
+    fontSize: 13,
+    color: '#B91C1C',
+    marginTop: 2,
   },
   primaryButton: {
     borderRadius: 12,
